@@ -1,8 +1,35 @@
+# Rust
 target/
 Cargo.lock
+
+# SP1 guest build artifacts (ELFs are checked in at elf/)
+sp1-guest/target/
+sp1-guest-full/target/
+
+# Test fixtures (regenerated via save_fixtures test)
+test/fixtures/
+
+# gnark circuit artifacts
 circuits/dcap-gnark/vendor/
+circuits/dcap-gnark/pk.bin
+circuits/dcap-gnark/vk.bin
 circuits/dcap-gnark/setup
 circuits/dcap-gnark/prove
 circuits/dcap-gnark/export-vkey
-test/fixtures/
-*.bin
+circuits/dcap-gnark/verify-remote
+circuits/dcap-gnark/testdata/
+
+# Environment
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
