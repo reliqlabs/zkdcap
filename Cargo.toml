@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "host",
+    "test",
+    "verifier",
+    "vkey-converter",
+    "examples/dstack-prove",
+    # sp1-guest and sp1-guest-full are built with the SP1 toolchain, not as workspace members
+]
+
+# Guest crates excluded from workspace — they use the SP1/RISC-V toolchain
+exclude = [
+    "sp1-guest",
+    "sp1-guest-full",
+]
+
+# Release profile — used by verifier WASM build and host binary
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+codegen-units = 1
+panic = 'abort'
+overflow-checks = true

@@ -1,0 +1,19 @@
+# Go build output (root-level binaries)
+/prove
+/setup
+/verify
+/verify-remote
+/export-vkey
+/gen-fixture
+
+# Proving artifacts
+pk.bin
+vk.bin
+proof.json
+result/
+
+# Vendored Go deps (Nix fetches via vendorHash)
+/vendor/
+
+# OS
+.DS_Store

@@ -1,0 +1,8 @@
+target/
+Cargo.lock
+circuits/dcap-gnark/vendor/
+circuits/dcap-gnark/setup
+circuits/dcap-gnark/prove
+circuits/dcap-gnark/export-vkey
+test/fixtures/
+*.bin
