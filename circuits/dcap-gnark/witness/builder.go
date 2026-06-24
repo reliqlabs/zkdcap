@@ -181,7 +181,7 @@ func BuildWitness(quoteBytes []byte, collateral map[string]string, timestamp uin
 		return nil, fmt.Errorf("crls: %w", err)
 	}
 
-	// === #2 tcbEvaluationDataNumber: offsets + min across both signed blobs ===
+	// === #2/#4 tcbEvaluationDataNumber: offsets + both blobs' values, emitted separately ===
 	evalCtx := []byte(`"tcbEvaluationDataNumber":`)
 	c.TcbEvalOff = mustIndex(tcbInfoRaw, evalCtx, "tcb eval number")
 	c.QeEvalOff = mustIndex(qeIDRaw, evalCtx, "qe eval number")

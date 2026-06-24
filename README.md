@@ -64,7 +64,7 @@ go run ./cmd/gen-fixture quote.bin collateral.json pre_verified.json
 `circuits/dcap-noir/crates/dcap` is the Barretenberg UltraHonk circuit. Toolchain:
 nargo 1.0.0-beta.19 + bb 4.0.4 (byte-compatible with Xion's `barretenberg-go` v0.4.0).
 
-- **1,946,397 gates** (under 2²¹); prove ~5.4 s / ~4.4 GB RAM (Apple M5 Max), write_vk ~3.0 s, vk 3680 B, proof 16000 B; no per-circuit trusted setup.
+- **1,946,389 gates** (under 2²¹); prove ~5.4 s / ~4.4 GB RAM (Apple M5 Max), write_vk ~3.0 s, vk 3680 B, proof 16000 B; no per-circuit trusted setup.
 - Two soundness-preserving optimizations vs the naive form: a rolling-fingerprint **product-accumulator** for CRL non-membership (a 20-byte serial is 160 bits < the BN254 field, so the big-endian window integer is injective; the product is zero iff some window matches), and a **prefix-sum** H1 status pin (one buffer scan replaces a per-level scan). Both audited sound-equivalent; crossing the 2²²→2²¹ dyadic bucket roughly halves prove time.
 - Deployed on **xion-testnet-2** as vkey `dcap-ultrahonk-v1` (id 15) and on-chain verified (`verify-ultrahonk → {"verified":true}`).
 
