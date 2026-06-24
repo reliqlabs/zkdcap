@@ -185,11 +185,8 @@ func BuildWitness(quoteBytes []byte, collateral map[string]string, timestamp uin
 	evalCtx := []byte(`"tcbEvaluationDataNumber":`)
 	c.TcbEvalOff = mustIndex(tcbInfoRaw, evalCtx, "tcb eval number")
 	c.QeEvalOff = mustIndex(qeIDRaw, evalCtx, "qe eval number")
-	evalNum := tcbInfo.TcbEvaluationDataNumber
-	if qeJSON.TcbEvaluationDataNumber < evalNum {
-		evalNum = qeJSON.TcbEvaluationDataNumber
-	}
-	c.TcbEvalNum = evalNum
+	c.TcbInfoEvalNum = tcbInfo.TcbEvaluationDataNumber
+	c.QeIdEvalNum = qeJSON.TcbEvaluationDataNumber
 
 	// === #3 intersected collateral validity window [ValidFrom, ValidUntil] ===
 	validFrom, validUntil, err := collateralValidityWindow(leaf, platformCA, signing, &tcbInfo, &qeJSON, pckCrl, rootCrl)

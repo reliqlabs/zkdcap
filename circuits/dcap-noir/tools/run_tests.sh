@@ -53,7 +53,7 @@ run "G3 attest-key"   fail g3-attest-key
 run "H3 expired-cert" fail expired-cert
 
 echo "== public-input size (Xion x/zk cap = 10240 B / 320 fields) =="
-# honest witness -> bb prove -> public_inputs must be <= 10240 B (20 packed fields = 640 B).
+# honest witness -> bb prove -> public_inputs must be <= 10240 B (21 packed fields = 672 B).
 "$GEN" -quote "$QUOTE" -collateral "$COLL" > "$DCAP/Prover.toml" 2>/dev/null
 ( cd "$DCAP" && nargo execute >/dev/null 2>&1 )
 PKDIR="$(mktemp -d)"; mkdir -p "$PKDIR/vk" "$PKDIR/proof"

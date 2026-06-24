@@ -15,7 +15,7 @@
 //        collateral freshness windows
 //
 // Public I/O: MrTd, Rtmr0..3, ReportData, TcbStatus, Timestamp, CertSerial,
-// Fmspc, TcbEvalNum (#2), ValidFrom, ValidUntil (#3).
+// Fmspc, TcbInfoEvalNum + QeIdEvalNum (#2/#4), ValidFrom, ValidUntil (#3).
 mod der;
 mod parse;
 mod chain;
@@ -129,7 +129,7 @@ fn main(
     rtmr3: [u8; 48],
     report_data: [u8; 64],
     timestamp: u64,
-) -> pub [Field; 20] {
+) -> pub [Field; 21] {
     // Pin the witness root to the hard-coded Intel SGX Root CA constant.
     let (rx, ry) = crate::chain::pin_root(root_x, root_y);
 
@@ -203,12 +203,14 @@ fn main(
     // -signed TCB-Info/QE-Identity (older eval number) could otherwise be replayed
     // inside its still-open freshness window to pick a more favorable status. The
     // on-chain consumer compares this against a monotonic floor. ----
+    // Emit BOTH eval numbers (issue #4): a single min() collapses two independently-
+    // advancing recency signals, letting a stale TCB-Info ride a current QE-Identity past
+    // a monotone floor. The consumer floor-checks each per-FMSPC.
     let eval_ctx = "\"tcbEvaluationDataNumber\":".as_bytes();
     let tcb_eval_chars: [u8; 6] = extract_field(tcb_info, tcb_eval_off, tcb_info_len, eval_ctx);
     let tcb_eval = crate::parse::parse_decimal(tcb_eval_chars);
     let qe_eval_chars: [u8; 6] = extract_field(qe_id, qe_eval_off, qe_id_len, eval_ctx);
     let qe_eval = crate::parse::parse_decimal(qe_eval_chars);
-    let eval_num = if tcb_eval < qe_eval { tcb_eval } else { qe_eval };
 
     // ---- G4 revocation: leaf serial not in PCK CRL; int serial not in Root CRL ----
     let (pca_x, pca_y) = crate::chain::extract_subject_pubkey(int_tbs, int_pk_off, int_len);
@@ -236,13 +238,13 @@ fn main(
     valid_until = crate::parse::min_u64(valid_until, crate::parse::min_u64(pck_next, root_next));
     assert(valid_from <= valid_until, "empty collateral validity intersection");
 
-    // ---- pack the public outputs into 20 BN254 field elements (Xion x/zk caps
+    // ---- pack the public outputs into 21 BN254 field elements (Xion x/zk caps
     // UltraHonk public inputs at 320 fields; one-byte-per-field would be far more).
     // Every byte below is already bound to the signed quote / leaf / collateral,
     // so the packed values are non-forgeable; this only changes the encoding.
     // Layout (must match the on-chain unpacker): mr_td, rtmr0..3 (2 limbs each),
     // report_data (3 limbs), tcb_status, timestamp, cert_serial, fmspc,
-    // tcb_eval_num, valid_from, valid_until. ----
+    // tcb_info_eval_num, qe_id_eval_num, valid_from, valid_until. ----
     let (mr0, mr1) = crate::parse::pack_48(mr_td);
     let (r00, r01) = crate::parse::pack_48(rtmr0);
     let (r10, r11) = crate::parse::pack_48(rtmr1);
@@ -260,8 +262,9 @@ fn main(
         timestamp as Field, // 15    timestamp
         crate::parse::pack_be(serial), // 16    cert_serial[20]
         crate::parse::pack_be(leaf_fmspc), // 17    fmspc[6]
-        eval_num as Field, // 18    tcb_eval_num = min(tcbEvaluationDataNumber)
-        valid_from as Field, // 19    valid_from  = max(window lower bounds)
-        valid_until as Field, // 20    valid_until = min(window upper bounds)
+        tcb_eval as Field, // 18    tcb_info_eval_num = TCB-Info tcbEvaluationDataNumber
+        qe_eval as Field, // 19    qe_id_eval_num    = QE-Identity tcbEvaluationDataNumber
+        valid_from as Field, // 20    valid_from  = max(window lower bounds)
+        valid_until as Field, // 21    valid_until = min(window upper bounds)
     ]
 }

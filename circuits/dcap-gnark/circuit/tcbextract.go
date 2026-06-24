@@ -398,7 +398,7 @@ func assertNoLiteralInRange(api frontend.API, buf []uints.U8, lo, hi frontend.Va
 
 // stepBindTcbData discharges G2: it binds the TCB-verdict comparison values to
 // the signature-anchored collateral and quote.
-func (c *DcapCircuit) stepBindTcbData(api frontend.API) (frontend.Variable, frontend.Variable, frontend.Variable, error) {
+func (c *DcapCircuit) stepBindTcbData(api frontend.API) (frontend.Variable, frontend.Variable, frontend.Variable, frontend.Variable, error) {
 	// Build ONE logderivlookup table per signed blob; every field read below is a
 	// ~3-constraint lookup instead of an O(buffer) selector (extract.go).
 	tcbTbl := newByteTable(api, c.TcbInfoRaw[:], c.TcbInfoRawLen)
@@ -438,8 +438,8 @@ func (c *DcapCircuit) stepBindTcbData(api frontend.API) (frontend.Variable, fron
 
 	// --- G4 freshness + #2 eval number + #3 freshness/cert validity window
 	// (reuses both blob tables). ---
-	evalNum, validFrom, validUntil := c.stepCheckFreshness(api, tcbTbl, qeTbl)
-	return evalNum, validFrom, validUntil, nil
+	tcbEval, qeEval, validFrom, validUntil := c.stepCheckFreshness(api, tcbTbl, qeTbl)
+	return tcbEval, qeEval, validFrom, validUntil, nil
 }
 
 // stepCheckFreshness discharges the validity-window half of G4: the Timestamp
@@ -448,11 +448,12 @@ func (c *DcapCircuit) stepBindTcbData(api frontend.API) (frontend.Variable, fron
 // the signed JSON (so a prover cannot widen the window), parsed to the same
 // packed integer, and compared. This rejects expired or not-yet-valid
 // collateral (e.g. replaying an old TCB-Info whose nextUpdate has passed).
-// Returns (evalNum, validFrom, validUntil): min tcbEvaluationDataNumber across
-// the two blobs (#2), and the freshness+cert half of the intersected validity
+// Returns (tcbEval, qeEval, validFrom, validUntil): both tcbEvaluationDataNumber
+// values, emitted separately (#2/#4 — a single min() doesn't close stale-TCB
+// selection per issue #4), and the freshness+cert half of the intersected validity
 // window (#3, max of lower bounds / min of upper bounds). The caller folds in the
 // two CRL windows.
-func (c *DcapCircuit) stepCheckFreshness(api frontend.API, tcbTbl, qeTbl *byteTable) (frontend.Variable, frontend.Variable, frontend.Variable) {
+func (c *DcapCircuit) stepCheckFreshness(api frontend.API, tcbTbl, qeTbl *byteTable) (frontend.Variable, frontend.Variable, frontend.Variable, frontend.Variable) {
 	dateCtx := []byte(`"issueDate":"`)
 	nextCtx := []byte(`"nextUpdate":"`)
 	const isoLen = 20 // "YYYY-MM-DDThh:mm:ssZ"
@@ -477,18 +478,17 @@ func (c *DcapCircuit) stepCheckFreshness(api frontend.API, tcbTbl, qeTbl *byteTa
 	intNb, intNa := checkCertValidity(api, c.IntTBS[:], c.IntValidityOff, c.IntTBSLen, c.Timestamp)
 	signNb, signNa := checkCertValidity(api, c.SignTBS[:], c.SignValidityOff, c.SignLen, c.Timestamp)
 
-	// #2: tcbEvaluationDataNumber from BOTH signed blobs; expose the min. A stale
-	// (older eval number) but still-validly-signed blob, replayed inside its open
-	// freshness window, is otherwise indistinguishable in-circuit.
+	// #2/#4: tcbEvaluationDataNumber from BOTH signed blobs, returned separately. A
+	// single min() lets a stale TCB-Info ride a current QE-Identity past a monotone
+	// floor (issue #4); the consumer floor-checks each per-FMSPC.
 	evalCtx := []byte(`"tcbEvaluationDataNumber":`)
 	tcbEval := parseDecimal(api, tcbTbl.extractFieldLU(c.TcbEvalOff, evalCtx, u16FieldWidth))
 	qeEval := parseDecimal(api, qeTbl.extractFieldLU(c.QeEvalOff, evalCtx, u16FieldWidth))
-	evalNum := api.Select(gteBool(api, tcbEval, qeEval), qeEval, tcbEval) // min(tcbEval, qeEval)
 
 	// #3: fold the freshness + cert windows into [valid_from, valid_until].
 	validFrom := maxVarWide(api, maxVarWide(api, tcbIssue, qeIssue), maxVarWide(api, leafNb, maxVarWide(api, intNb, signNb)))
 	validUntil := minVarWide(api, minVarWide(api, tcbNext, qeNext), minVarWide(api, leafNa, minVarWide(api, intNa, signNa)))
-	return evalNum, validFrom, validUntil
+	return tcbEval, qeEval, validFrom, validUntil
 }
 
 // checkCertValidity asserts notBefore <= timestamp <= notAfter for an X.509 cert

@@ -77,7 +77,7 @@ func (c *DcapCircuit) Define(api frontend.API) error {
 	// collateral / ISV-signed quote, so steps 8-10 compare signed data, not
 	// free witness.
 	// ----------------------------------------------------------------
-	evalNum, freshLo, freshHi, err := c.stepBindTcbData(api)
+	tcbEval, qeEval, freshLo, freshHi, err := c.stepBindTcbData(api)
 	if err != nil {
 		return err
 	}
@@ -102,7 +102,7 @@ func (c *DcapCircuit) Define(api frontend.API) error {
 	// step also folds the CRL windows into the validity intersection and binds the
 	// #2/#3 public outputs.
 	// ----------------------------------------------------------------
-	return c.stepVerifyRevocation(api, evalNum, freshLo, freshHi)
+	return c.stepVerifyRevocation(api, tcbEval, qeEval, freshLo, freshHi)
 }
 
 // stepVerifyRevocation discharges the revocation half of G4. It re-extracts the
@@ -110,7 +110,7 @@ func (c *DcapCircuit) Define(api frontend.API) error {
 // the PCK CRL, uses the pinned Intel root for the Root CA CRL, and proves that
 // neither the leaf serial (in the PCK CRL) nor the intermediate serial (in the
 // Root CRL) is revoked.
-func (c *DcapCircuit) stepVerifyRevocation(api frontend.API, evalNum, freshLo, freshHi frontend.Variable) error {
+func (c *DcapCircuit) stepVerifyRevocation(api frontend.API, tcbEval, qeEval, freshLo, freshHi frontend.Variable) error {
 	// Platform CA subject key (the PCK CRL issuer) from the intermediate TBS.
 	ix, iy, err := extractSubjectPubKey(api, c.IntTBS[:], c.IntPubKeyOff, c.IntTBSLen)
 	if err != nil {
@@ -146,8 +146,9 @@ func (c *DcapCircuit) stepVerifyRevocation(api frontend.API, evalNum, freshLo, f
 	api.AssertIsEqual(validFrom, c.ValidFrom)
 	api.AssertIsEqual(validUntil, c.ValidUntil)
 
-	// #2: bind the min tcbEvaluationDataNumber public output.
-	api.AssertIsEqual(evalNum, c.TcbEvalNum)
+	// #2/#4: bind both tcbEvaluationDataNumber public outputs separately.
+	api.AssertIsEqual(tcbEval, c.TcbInfoEvalNum)
+	api.AssertIsEqual(qeEval, c.QeIdEvalNum)
 	return nil
 }
 
