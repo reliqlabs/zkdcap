@@ -10,7 +10,7 @@ import (
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 
-	"github.com/reliqlabs/oauth3/circuits/dcap-gnark/circuit"
+	"github.com/reliqlabs/zkdcap/circuits/dcap-gnark/circuit"
 )
 
 func main() {

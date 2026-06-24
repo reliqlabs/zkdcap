@@ -107,13 +107,32 @@ func assertGte(api frontend.API, a, b frontend.Variable) {
 	api.ToBinary(diff, 32) // will fail if diff < 0 (underflow)
 }
 
-// maxVar returns max(a, b) for small frontend variables.
-func maxVar(api frontend.API, a, b frontend.Variable) frontend.Variable {
-	// Compute a - b. If a >= b, the high bit of the field element is 0.
+// assertGteWide asserts a >= b for values up to ~2^52 (packed YYYYMMDDhhmmss
+// timestamps need ~47 bits). Same underflow-detection idea as assertGte but with
+// a wider bit decomposition.
+func assertGteWide(api frontend.API, a, b frontend.Variable) {
 	diff := api.Sub(a, b)
-	bits := api.ToBinary(diff, 253)
-	isNeg := bits[252] // high bit set means underflow (a < b)
-	isGte := api.Sub(1, isNeg)
+	api.ToBinary(diff, 52)
+}
+
+// gteBool returns 1 iff a >= b for small non-negative values (< 2^24), WITHOUT
+// asserting. Used by the canonical-TCB-level rule (G5) which needs a
+// satisfiability boolean per level rather than a hard assert.
+func gteBool(api frontend.API, a, b frontend.Variable) frontend.Variable {
+	const n = 24 // a, b assumed < 2^n (SVN bytes/u16 fit comfortably)
+	shifted := api.Add(api.Sub(a, b), 1<<n) // in [1, 2^(n+1)) when |a-b| < 2^n
+	bits := api.ToBinary(shifted, n+1)
+	return bits[n] // 1 iff a >= b
+}
+
+// maxVar returns max(a, b) for small frontend variables (e.g. TCB severity
+// codes). It compares via an offset bit decomposition that stays positive, so
+// ToBinary never sees a field-wrapped (negative) value for either ordering.
+func maxVar(api frontend.API, a, b frontend.Variable) frontend.Variable {
+	const n = 16 // a, b assumed < 2^n
+	shifted := api.Add(api.Sub(a, b), 1<<n) // in [1, 2^(n+1)-1] when |a-b| < 2^n
+	bits := api.ToBinary(shifted, n+1)
+	isGte := bits[n] // 1 iff a >= b
 	return api.Select(isGte, a, b)
 }
 
@@ -121,3 +140,4 @@ func maxVar(api frontend.API, a, b frontend.Variable) frontend.Variable {
 func u16FromLEBytes(api frontend.API, lo, hi uints.U8) frontend.Variable {
 	return api.Add(lo.Val, api.Mul(hi.Val, 256))
 }
+

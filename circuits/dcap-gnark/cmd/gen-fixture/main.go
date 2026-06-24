@@ -11,7 +11,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/reliqlabs/oauth3/circuits/dcap-gnark/witness"
+	"github.com/reliqlabs/zkdcap/circuits/dcap-gnark/witness"
 )
 
 // RawCollateral matches the JSON structure from dcap_qvl::collateral.

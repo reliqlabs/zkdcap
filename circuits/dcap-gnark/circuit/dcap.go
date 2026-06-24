@@ -3,16 +3,42 @@ package circuit
 import (
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/std/algebra/emulated/sw_emulated"
+	"github.com/consensys/gnark/std/math/emulated"
 	"github.com/consensys/gnark/std/math/uints"
 )
 
-// Define implements the gnark circuit interface. It performs DCAP quote
-// verification steps 4-10 (lite path).
+// Define implements the gnark circuit interface. It performs the full
+// self-anchoring DCAP path: chain to the pinned Intel root (A1), Intel-signed
+// collateral (A2), and quote verification steps 4-10.
 func (c *DcapCircuit) Define(api frontend.API) error {
 	// ----------------------------------------------------------------
-	// Step 0: Compute quote hash and bind public inputs to witness
+	// Step 0: Bind public measurement inputs from the signed quote
 	// ----------------------------------------------------------------
 	if err := c.stepBindPublicInputs(api); err != nil {
+		return err
+	}
+
+	// ----------------------------------------------------------------
+	// A1: PCK chain (leaf <- Platform CA <- pinned Intel Root). Binds
+	// PckPubKey to the leaf subjectPublicKey, so step 4 below trusts a
+	// chain-anchored key rather than a host-supplied one.
+	// ----------------------------------------------------------------
+	if err := c.stepVerifyChain(api); err != nil {
+		return err
+	}
+
+	// ----------------------------------------------------------------
+	// A2: Intel-signed collateral (TCB-Signing cert + TCB-Info + QE-Identity).
+	// ----------------------------------------------------------------
+	if err := c.stepVerifyCollateral(api); err != nil {
+		return err
+	}
+
+	// ----------------------------------------------------------------
+	// Bind platform identity (FMSPC) and PCK serial from signature-anchored
+	// bytes, and expose them as public outputs for the on-chain revoked set.
+	// ----------------------------------------------------------------
+	if err := c.stepBindIdentityOutputs(api); err != nil {
 		return err
 	}
 
@@ -46,6 +72,16 @@ func (c *DcapCircuit) Define(api frontend.API) error {
 	}
 
 	// ----------------------------------------------------------------
+	// G2: bind every TCB-verdict comparison value (svn components, pcesvn,
+	// tcbStatus, QE policy + QE TCB levels, platform SVNs) to the Intel-signed
+	// collateral / ISV-signed quote, so steps 8-10 compare signed data, not
+	// free witness.
+	// ----------------------------------------------------------------
+	if err := c.stepBindTcbData(api); err != nil {
+		return err
+	}
+
+	// ----------------------------------------------------------------
 	// Step 8: Match platform TCB level
 	// ----------------------------------------------------------------
 	if err := c.step8MatchPlatformTcb(api); err != nil {
@@ -55,7 +91,42 @@ func (c *DcapCircuit) Define(api frontend.API) error {
 	// ----------------------------------------------------------------
 	// Steps 9-10: Merge TCB statuses and bind final status
 	// ----------------------------------------------------------------
-	return c.step9and10MergeStatus(api)
+	if err := c.step9and10MergeStatus(api); err != nil {
+		return err
+	}
+
+	// ----------------------------------------------------------------
+	// G4 (revocation): the PCK leaf serial is not in the Platform-CA-signed PCK
+	// CRL, and the intermediate serial is not in the Root-CA-signed Root CRL.
+	// ----------------------------------------------------------------
+	return c.stepVerifyRevocation(api)
+}
+
+// stepVerifyRevocation discharges the revocation half of G4. It re-extracts the
+// Platform CA subject key from the (chain-anchored) intermediate TBS to verify
+// the PCK CRL, uses the pinned Intel root for the Root CA CRL, and proves that
+// neither the leaf serial (in the PCK CRL) nor the intermediate serial (in the
+// Root CRL) is revoked.
+func (c *DcapCircuit) stepVerifyRevocation(api frontend.API) error {
+	// Platform CA subject key (the PCK CRL issuer) from the intermediate TBS.
+	ix, iy, err := extractSubjectPubKey(api, c.IntTBS[:], c.IntPubKeyOff, c.IntTBSLen)
+	if err != nil {
+		return err
+	}
+	platformCA := ECDSAPublicKey{X: *ix, Y: *iy}
+
+	// Leaf serial (signature-anchored, 20 canonical bytes) for the PCK CRL. The
+	// CRL is structurally anchored (C4) and freshness-checked against Timestamp
+	// (C5) inside verifyCrlNonMembership.
+	leafSerial := extractCertSerial(api, c.LeafTBS[:], c.LeafSerialOff, c.LeafTBSLen)
+	if err := verifyCrlNonMembership(api, c.PckCrlTBS[:], c.PckCrlTBSLen, &platformCA, &c.PckCrlSig, leafSerial, c.PckCrlThisUpdateOff, c.Timestamp); err != nil {
+		return err
+	}
+
+	// Intermediate serial for the Root CA CRL, issued by the pinned root.
+	intSerial := extractCertSerial(api, c.IntTBS[:], c.IntSerialOff, c.IntTBSLen)
+	root := intelRootCAPubKey()
+	return verifyCrlNonMembership(api, c.RootCrlTBS[:], c.RootCrlTBSLen, &root, &c.RootCrlSig, intSerial, c.RootCrlThisUpdateOff, c.Timestamp)
 }
 
 // stepBindPublicInputs binds TDReport fields from the private signed quote
@@ -85,6 +156,52 @@ func (c *DcapCircuit) stepBindPublicInputs(api frontend.API) error {
 
 	// Bind ReportData
 	return assertBytesEqualRange(api, c.SignedQuote[:], SQ_ReportData, c.ReportData[:], 0, 64)
+}
+
+// stepVerifyChain discharges A1: it proves the PCK leaf chains to the pinned
+// Intel SGX Root CA and binds PckPubKey to the leaf subjectPublicKey.
+func (c *DcapCircuit) stepVerifyChain(api frontend.API) error {
+	return verifyChainToRoot(api,
+		c.LeafTBS[:], c.LeafTBSLen, &c.LeafSig, c.LeafPubKeyOff,
+		c.IntTBS[:], c.IntTBSLen, &c.IntSig, c.IntPubKeyOff,
+		&c.PckPubKey)
+}
+
+// stepVerifyCollateral discharges A2: the Intel TCB-Signing cert chains to the
+// pinned root and signs both the TCB-Info and QE-Identity JSON documents.
+func (c *DcapCircuit) stepVerifyCollateral(api frontend.API) error {
+	_, err := verifyCollateral(api,
+		c.SignTBS[:], c.SignLen, &c.SignSig, c.SignPubOff,
+		c.TcbInfoRaw[:], c.TcbInfoRawLen, &c.TcbInfoSig,
+		c.QeIDRaw[:], c.QeIDRawLen, &c.QeIDSig)
+	return err
+}
+
+// stepBindIdentityOutputs derives the platform FMSPC and PCK serial from the
+// signature-anchored leaf/collateral bytes and binds them to the public
+// outputs. It also cross-checks that the leaf FMSPC equals the FMSPC inside
+// the Intel-signed TCB-Info JSON, so the collateral provably belongs to this
+// platform (closing the FMSPC-substitution gap).
+func (c *DcapCircuit) stepBindIdentityOutputs(api frontend.API) error {
+	// FMSPC from the PCK leaf: 6 raw DER bytes after the FMSPC OID context.
+	leafFmspc := extractField(api, c.LeafTBS[:], c.LeafFmspcOff, c.LeafTBSLen, fmspcCtx, fmspcLen)
+
+	// FMSPC from the Intel-signed TCB-Info JSON: 12 uppercase-hex characters
+	// after the "fmspc":" anchor, parsed to 6 bytes.
+	tcbHex := extractField(api, c.TcbInfoRaw[:], c.TcbInfoFmspcOff, c.TcbInfoRawLen, tcbInfoFmspcCtx, 2*fmspcLen)
+	tcbFmspc := hexBytesToBytes(api, tcbHex)
+
+	for i := 0; i < fmspcLen; i++ {
+		api.AssertIsEqual(leafFmspc[i], tcbFmspc[i])
+		api.AssertIsEqual(leafFmspc[i], c.Fmspc[i].Val)
+	}
+
+	// PCK leaf serial -> public output (handles 20/21-byte DER encoding).
+	serial := extractCertSerial(api, c.LeafTBS[:], c.LeafSerialOff, c.LeafTBSLen)
+	for i := 0; i < certSerialLen; i++ {
+		api.AssertIsEqual(serial[i], c.CertSerial[i].Val)
+	}
+	return nil
 }
 
 // step4VerifyQeReportSig verifies the ECDSA-P256 signature over the QE report
@@ -123,8 +240,37 @@ func (c *DcapCircuit) step5VerifyQeReportData(api frontend.API) error {
 	}
 
 	// Compare with QE report's report_data[0:32]
-	return assertBytesEqual(api, digest[:],
-		c.QeReport[QER_ReportData:QER_ReportData+32])
+	if err := assertBytesEqual(api, digest[:],
+		c.QeReport[QER_ReportData:QER_ReportData+32]); err != nil {
+		return err
+	}
+
+	// SOUNDNESS (G3): the raw attestation key hashed above (committed in the
+	// PCK-signed QE report) must be the SAME key that verifies the quote body in
+	// step 7. Otherwise AttestKeyRaw and AttestKeyPub are independent witnesses,
+	// and a prover could keep a genuine QE report yet sign a fabricated quote
+	// under a self-chosen AttestKeyPub. Bind the emulated point to the raw bytes.
+	rawX := make([]frontend.Variable, 32)
+	rawY := make([]frontend.Variable, 32)
+	for i := 0; i < 32; i++ {
+		rawX[i] = c.AttestKeyRaw[i].Val
+		rawY[i] = c.AttestKeyRaw[32+i].Val
+	}
+	akx, err := bytesVarToP256Fp(api, rawX)
+	if err != nil {
+		return err
+	}
+	aky, err := bytesVarToP256Fp(api, rawY)
+	if err != nil {
+		return err
+	}
+	f, err := emulated.NewField[P256Fp](api)
+	if err != nil {
+		return err
+	}
+	f.AssertIsEqual(akx, &c.AttestKeyPub.X)
+	f.AssertIsEqual(aky, &c.AttestKeyPub.Y)
+	return nil
 }
 
 // step6VerifyQePolicy checks QE identity policy fields against the QE report.
@@ -181,60 +327,89 @@ func (c *DcapCircuit) step7VerifyIsvReportSig(api frontend.API) error {
 	return nil
 }
 
-// step8MatchPlatformTcb verifies the platform TCB level match using the host hint.
+// step8MatchPlatformTcb verifies the platform TCB level match and forces the
+// CANONICAL (first-satisfiable) level selection (G5). Intel orders tcbLevels
+// descending by SVN, so the correct verdict is the FIRST level the platform
+// satisfies. A prover must not pick an older, softer-severity level that the
+// platform also satisfies.
+//
+// For each level m we compute a boolean satisfied[m] (all platform components
+// >= level m's thresholds) WITHOUT asserting, then require:
+//   - satisfied[m] == 0 for every active level m < TcbMatchIdx, and
+//   - satisfied[TcbMatchIdx] == 1.
+// The platform/TCB-Info FMSPC equality is enforced in stepBindIdentityOutputs;
+// the per-level thresholds are bound to the signed JSON in stepBindTcbData.
 func (c *DcapCircuit) step8MatchPlatformTcb(api frontend.API) error {
-	// 1. FMSPC exact match
-	if err := assertBytesEqual(api, c.PlatformFmspc[:], c.TcbInfoFmspc[:]); err != nil {
-		return err
-	}
-
-	// 2. Verify the hinted TCB level matches
 	idx := c.TcbMatchIdx
-
-	// a. PCE SVN: platform >= tcb_level
-	tcbPceSvn := muxVar(api, c.TcbPceSvn[:], idx)
-	assertGte(api, c.PlatformPceSvn, tcbPceSvn)
-
-	// b. SGX components: cpu_svn[i] >= sgx_comp[i] for all i
-	for i := 0; i < MaxSgxComponents; i++ {
-		// Build array of tcb_levels[*].sgx_comps[i]
-		compArr := make([]frontend.Variable, MaxTcbLevels)
-		for j := 0; j < MaxTcbLevels; j++ {
-			compArr[j] = c.TcbSgxComps[j][i]
-		}
-		tcbComp := muxVar(api, compArr, idx)
-		assertGte(api, c.PlatformCpuSvn[i].Val, tcbComp)
-	}
-
-	// c. TDX components: tee_tcb_svn[i] >= tdx_comp[i] for all i
-	for i := 0; i < MaxTdxComponents; i++ {
-		compArr := make([]frontend.Variable, MaxTcbLevels)
-		for j := 0; j < MaxTcbLevels; j++ {
-			compArr[j] = c.TcbTdxComps[j][i]
-		}
-		tcbComp := muxVar(api, compArr, idx)
-		assertGte(api, c.PlatformTeeTcbSvn[i].Val, tcbComp)
-	}
-
-	// 3. Verify hint index is within bounds
+	// C1 (CRITICAL): range-decompose the match index onto a real slot. Without
+	// this, a prover sets idx to a field element like p-1 (the additive inverse
+	// of 1): the assertGte upper bound below still passes (count-1-idx wraps to a
+	// small positive), every IsZero(idx-m)==0 so isChosen is never 1 and the
+	// "chosen must be satisfied" check goes vacuous, and muxVar(TcbSeverity,idx)
+	// returns 0 -> a forged UpToDate verdict for any platform. ToBinary(idx,4)
+	// forces idx into [0,16) (MaxTcbLevels), and the upper bound then pins it to
+	// an active slot.
+	api.ToBinary(idx, 4) // MaxTcbLevels = 16 -> 4 bits
+	// Hint index within the derived (signed) level count.
 	assertGte(api, api.Sub(c.TcbLevelCount, 1), idx)
 
+	for m := 0; m < MaxTcbLevels; m++ {
+		sat := c.platformSatisfiesLevel(api, m)
+		// active iff m < TcbLevelCount (padding slots repeat the last real level,
+		// so they would also be "satisfied"; exclude them from the ordering rule).
+		active := isLessThan(api, m, c.TcbLevelCount)
+		isChosen := api.IsZero(api.Sub(idx, m))
+		before := isLessThanVar(api, m, idx) // m < idx
+		// Chosen level must be satisfied.
+		api.AssertIsEqual(api.Mul(isChosen, api.Sub(1, sat)), 0)
+		// Every active level strictly before the chosen one must be UNsatisfied
+		// (else it would be the canonical pick).
+		api.AssertIsEqual(api.Mul(api.Mul(active, before), sat), 0)
+	}
 	return nil
+}
+
+// platformSatisfiesLevel returns 1 iff the platform's CPU/PCE/TEE SVNs all meet
+// or exceed level m's thresholds (the same comparison step8 used to assert, but
+// as a boolean for the canonical-selection rule).
+func (c *DcapCircuit) platformSatisfiesLevel(api frontend.API, m int) frontend.Variable {
+	ok := frontend.Variable(1)
+	// PCE SVN
+	ok = api.Mul(ok, gteBool(api, c.PlatformPceSvn, c.TcbPceSvn[m]))
+	// SGX components
+	for i := 0; i < MaxSgxComponents; i++ {
+		ok = api.Mul(ok, gteBool(api, c.PlatformCpuSvn[i].Val, c.TcbSgxComps[m][i]))
+	}
+	// TDX components
+	for i := 0; i < MaxTdxComponents; i++ {
+		ok = api.Mul(ok, gteBool(api, c.PlatformTeeTcbSvn[i].Val, c.TcbTdxComps[m][i]))
+	}
+	return ok
 }
 
 // step9and10MergeStatus computes QE TCB status and merges with platform TCB status.
 func (c *DcapCircuit) step9and10MergeStatus(api frontend.API) error {
-	// Step 9: QE TCB matching — verify hint
+	// Step 9: QE TCB matching with canonical (first-satisfiable) selection (G5).
 	qeIdx := c.QeTcbMatchIdx
 	qeIsvSvn := u16FromLEBytes(api,
 		c.QeReport[QER_IsvSvn], c.QeReport[QER_IsvSvn+1])
 
-	// Verify: qe_report.isv_svn >= qe_tcb_level[qeIdx].isvsvn
-	qeTcbThreshold := muxVar(api, c.QeIdTcbIsvSvn[:], qeIdx)
-	assertGte(api, qeIsvSvn, qeTcbThreshold)
-
-	// Verify QE hint index within bounds
+	// C1 (CRITICAL): range-decompose the QE match index onto a real slot (same
+	// forged-UpToDate-via-out-of-range-index attack as the platform index).
+	api.ToBinary(qeIdx, 3) // MaxQeTcbLevels = 8 -> 3 bits
+	// Verify QE hint index within the derived (signed) level count.
 	assertGte(api, api.Sub(c.QeIdTcbCount, 1), qeIdx)
+
+	// Canonical selection: the chosen QE level must be satisfied
+	// (qe_isv_svn >= threshold), and every active level before it must NOT be.
+	for m := 0; m < MaxQeTcbLevels; m++ {
+		sat := gteBool(api, qeIsvSvn, c.QeIdTcbIsvSvn[m])
+		active := isLessThan(api, m, c.QeIdTcbCount)
+		isChosen := api.IsZero(api.Sub(qeIdx, m))
+		before := isLessThanVar(api, m, qeIdx)
+		api.AssertIsEqual(api.Mul(isChosen, api.Sub(1, sat)), 0)
+		api.AssertIsEqual(api.Mul(api.Mul(active, before), sat), 0)
+	}
 
 	// Get QE severity
 	qeSeverity := muxVar(api, c.QeIdTcbSeverity[:], qeIdx)

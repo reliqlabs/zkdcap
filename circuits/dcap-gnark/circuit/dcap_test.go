@@ -3,23 +3,30 @@ package circuit_test
 import (
 	"encoding/json"
 	"os"
-	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/backend"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
+	"github.com/consensys/gnark/std/math/uints"
 	"github.com/consensys/gnark/test"
 
-	"github.com/reliqlabs/oauth3/circuits/dcap-gnark/circuit"
-	"github.com/reliqlabs/oauth3/circuits/dcap-gnark/witness"
+	"github.com/reliqlabs/zkdcap/circuits/dcap-gnark/circuit"
+	"github.com/reliqlabs/zkdcap/circuits/dcap-gnark/witness"
 )
 
 const fixtureDir = "../testdata/fixtures/zkdcap/"
 
-func loadFixtures(t *testing.T) ([]byte, *witness.PreVerifiedInputs, uint64) {
+// fixedTimestamp: a verification time INSIDE the fixture collateral's validity
+// window (G4). The TCB-Info window is [2025-06-19T10:16:03Z, 2025-07-19], the
+// QE-Identity window [2025-06-19T10:32:27Z, 2025-07-19]; 2025-06-25T00:00:00Z
+// (unix 1750809600) sits inside both. The circuit interprets this unix value as
+// a packed YYYYMMDDhhmmss date (the witness builder converts it).
+const fixedTimestamp = uint64(1750809600)
+
+// loadFixtures reads the real dcap-qvl sample quote + Intel collateral bundle.
+func loadFixtures(t *testing.T) ([]byte, map[string]string) {
 	t.Helper()
 
 	quoteBytes, err := os.ReadFile(fixtureDir + "quote.bin")
@@ -27,31 +34,16 @@ func loadFixtures(t *testing.T) ([]byte, *witness.PreVerifiedInputs, uint64) {
 		t.Fatalf("read quote.bin: %v", err)
 	}
 
-	preBytes, err := os.ReadFile(fixtureDir + "pre_verified.json")
+	collBytes, err := os.ReadFile(fixtureDir + "collateral.json")
 	if err != nil {
-		t.Fatalf("read pre_verified.json: %v", err)
+		t.Fatalf("read collateral.json: %v", err)
+	}
+	var coll map[string]string
+	if err := json.Unmarshal(collBytes, &coll); err != nil {
+		t.Fatalf("parse collateral.json: %v", err)
 	}
 
-	var preJSON witness.PreVerifiedJSON
-	if err := json.Unmarshal(preBytes, &preJSON); err != nil {
-		t.Fatalf("parse pre_verified.json: %v", err)
-	}
-
-	pre, err := preJSON.ToPreVerifiedInputs()
-	if err != nil {
-		t.Fatalf("convert pre_verified: %v", err)
-	}
-
-	tsBytes, err := os.ReadFile(fixtureDir + "timestamp.txt")
-	if err != nil {
-		t.Fatalf("read timestamp.txt: %v", err)
-	}
-	ts, err := strconv.ParseUint(strings.TrimSpace(string(tsBytes)), 10, 64)
-	if err != nil {
-		t.Fatalf("parse timestamp: %v", err)
-	}
-
-	return quoteBytes, pre, ts
+	return quoteBytes, coll
 }
 
 func TestCircuitCompile(t *testing.T) {
@@ -62,10 +54,28 @@ func TestCircuitCompile(t *testing.T) {
 	t.Logf("Constraints: %d", ccs.GetNbConstraints())
 }
 
-func TestCircuitProveVerify(t *testing.T) {
-	quoteBytes, pre, ts := loadFixtures(t)
+// TestCircuitSolves runs the solver (no trusted setup) over the full
+// self-anchoring circuit on the real quote + collateral. Fast smoke test.
+func TestCircuitSolves(t *testing.T) {
+	quoteBytes, coll := loadFixtures(t)
 
-	assignment, err := witness.BuildWitness(quoteBytes, pre, ts)
+	assignment, err := witness.BuildWitness(quoteBytes, coll, fixedTimestamp)
+	if err != nil {
+		t.Fatalf("build witness: %v", err)
+	}
+
+	if err := test.IsSolved(&circuit.DcapCircuit{}, assignment, ecc.BN254.ScalarField()); err != nil {
+		t.Fatalf("expected satisfiable: %v", err)
+	}
+}
+
+func TestCircuitProveVerify(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping full Groth16 prove/verify in -short mode")
+	}
+	quoteBytes, coll := loadFixtures(t)
+
+	assignment, err := witness.BuildWitness(quoteBytes, coll, fixedTimestamp)
 	if err != nil {
 		t.Fatalf("build witness: %v", err)
 	}
@@ -78,19 +88,55 @@ func TestCircuitProveVerify(t *testing.T) {
 }
 
 func TestCircuitNegativeFlippedSig(t *testing.T) {
-	quoteBytes, pre, ts := loadFixtures(t)
+	quoteBytes, coll := loadFixtures(t)
 
-	assignment, err := witness.BuildWitness(quoteBytes, pre, ts)
+	assignment, err := witness.BuildWitness(quoteBytes, coll, fixedTimestamp)
 	if err != nil {
 		t.Fatalf("build witness: %v", err)
 	}
 
-	// Flip a byte in the ISV signature to make verification fail
-	assignment.IsvSig.R = assignment.QeReportSig.R // wrong R value
+	// Flip the ISV signature so step 7 verification fails.
+	assignment.IsvSig.R = assignment.QeReportSig.R
 
-	assert := test.NewAssert(t)
-	assert.ProverFailed(&circuit.DcapCircuit{}, assignment,
-		test.WithCurves(ecc.BN254),
-		test.WithBackends(backend.GROTH16),
-	)
+	if err := test.IsSolved(&circuit.DcapCircuit{}, assignment, ecc.BN254.ScalarField()); err == nil {
+		t.Fatal("expected unsatisfiable for flipped ISV signature")
+	}
+}
+
+// TestCircuitNegativeForgedPckKey proves the self-anchoring property: an
+// attacker cannot substitute their own PCK key. PckPubKey is constrained equal
+// to the chain leaf's subjectPublicKey, so swapping it (here, to the attestation
+// key) breaks the leaf binding.
+func TestCircuitNegativeForgedPckKey(t *testing.T) {
+	quoteBytes, coll := loadFixtures(t)
+
+	assignment, err := witness.BuildWitness(quoteBytes, coll, fixedTimestamp)
+	if err != nil {
+		t.Fatalf("build witness: %v", err)
+	}
+
+	assignment.PckPubKey.X = assignment.AttestKeyPub.X
+	assignment.PckPubKey.Y = assignment.AttestKeyPub.Y
+
+	if err := test.IsSolved(&circuit.DcapCircuit{}, assignment, ecc.BN254.ScalarField()); err == nil {
+		t.Fatal("expected unsatisfiable for forged PCK key (chain binding must reject)")
+	}
+}
+
+// TestCircuitNegativeTamperedCollateral flips a byte in the Intel-signed
+// TCB-Info JSON; the collateral signature check (A2) must reject it.
+func TestCircuitNegativeTamperedCollateral(t *testing.T) {
+	quoteBytes, coll := loadFixtures(t)
+
+	assignment, err := witness.BuildWitness(quoteBytes, coll, fixedTimestamp)
+	if err != nil {
+		t.Fatalf("build witness: %v", err)
+	}
+
+	// Corrupt a byte well inside the TCB-Info JSON body (ASCII, so 0xFF differs).
+	assignment.TcbInfoRaw[100] = uints.NewU8(0xFF)
+
+	if err := test.IsSolved(&circuit.DcapCircuit{}, assignment, ecc.BN254.ScalarField()); err == nil {
+		t.Fatal("expected unsatisfiable for tampered TCB-Info collateral")
+	}
 }

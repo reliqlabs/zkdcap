@@ -94,19 +94,30 @@ type ECDSASignature = stdecdsa.Signature[P256Fr]
 
 // ----- Circuit definition -----
 
-// DcapCircuit implements DCAP quote verification steps 4-10 as a gnark circuit.
+// DcapCircuit implements the self-anchoring DCAP TDX verification path: the PCK
+// cert chain to the pinned Intel SGX Root CA (A1), the Intel-signed collateral
+// (A2), and quote verification steps 4-10. Every value the verifier relies on
+// is either a public input/output or is constrained in-circuit to a
+// signature-anchored source, so a forged proof cannot substitute its own key,
+// quote, or collateral.
 type DcapCircuit struct {
-	// === Public inputs (DcapJournal) ===
-	MrTd       [48]uints.U8       `gnark:",public"`
-	Rtmr0      [48]uints.U8       `gnark:",public"`
-	Rtmr1      [48]uints.U8       `gnark:",public"`
-	Rtmr2      [48]uints.U8       `gnark:",public"`
-	Rtmr3      [48]uints.U8       `gnark:",public"`
-	ReportData [64]uints.U8       `gnark:",public"`
-	TcbStatus  frontend.Variable  `gnark:",public"`
-	Timestamp  frontend.Variable  `gnark:",public"`
+	// === Public inputs / outputs ===
+	// Measurements + report data, bound from the signature-anchored signed quote.
+	MrTd       [48]uints.U8 `gnark:",public"`
+	Rtmr0      [48]uints.U8 `gnark:",public"`
+	Rtmr1      [48]uints.U8 `gnark:",public"`
+	Rtmr2      [48]uints.U8 `gnark:",public"`
+	Rtmr3      [48]uints.U8 `gnark:",public"`
+	ReportData [64]uints.U8 `gnark:",public"`
+	// TcbStatus is computed in-circuit (steps 8-10) and exposed as a public output.
+	TcbStatus frontend.Variable `gnark:",public"`
+	Timestamp frontend.Variable `gnark:",public"`
+	// Self-anchoring outputs for the on-chain revoked-set check: the PCK leaf
+	// serial and the platform FMSPC, both extracted from signature-bound bytes.
+	CertSerial [certSerialLen]uints.U8 `gnark:",public"`
+	Fmspc      [fmspcLen]uints.U8      `gnark:",public"`
 
-	// === Private inputs ===
+	// === Quote (steps 4-10) ===
 
 	// Signed quote region (header + TDReport10 = 632 bytes)
 	SignedQuote [SignedQuoteLen]uints.U8
@@ -114,7 +125,8 @@ type DcapCircuit struct {
 	// QE Report (384 bytes, from AuthData)
 	QeReport [EnclaveReportLen]uints.U8
 
-	// PCK public key (trusted, from host cert chain validation)
+	// PCK public key. Constrained equal to the PCK leaf subjectPublicKey by the
+	// chain check (verifyChainToRoot), so it is no longer trusted from the host.
 	PckPubKey ECDSAPublicKey
 
 	// QE Report ECDSA signature (over QeReport, verified with PckPubKey)
@@ -131,7 +143,74 @@ type DcapCircuit struct {
 	QeAuthData    [32]uints.U8
 	QeAuthDataLen frontend.Variable
 
-	// QE Identity policy fields
+	// === PCK cert chain (A1: leaf <- Intel SGX PCK Platform CA <- pinned Root) ===
+	LeafTBS       [maxLeafTBS]uints.U8
+	LeafTBSLen    frontend.Variable
+	LeafSig       ECDSASignature
+	LeafPubKeyOff frontend.Variable // hint: offset of subjectPublicKey in leaf TBS
+	LeafFmspcOff  frontend.Variable // hint: offset of FMSPC extension in leaf TBS
+	LeafSerialOff frontend.Variable // hint: offset of version/serial context in leaf TBS
+	LeafCpuSvnOff frontend.Variable // hint: offset of CPUSVN OID in leaf TBS (G2)
+	LeafPceSvnOff frontend.Variable // hint: offset of PCESVN OID in leaf TBS (G2)
+	LeafValidityOff frontend.Variable // hint: offset of Validity SEQUENCE in leaf TBS (H3)
+
+	IntTBS       [maxIntTBS]uints.U8
+	IntTBSLen    frontend.Variable
+	IntSig       ECDSASignature
+	IntPubKeyOff frontend.Variable // hint: offset of subjectPublicKey in intermediate TBS
+	IntSerialOff frontend.Variable // hint: offset of version/serial context in intermediate TBS (G4)
+	IntValidityOff frontend.Variable // hint: offset of Validity SEQUENCE in intermediate TBS (H3)
+
+	// === Collateral (A2: TCB-Signing cert + TCB-Info + QE-Identity, Intel-signed) ===
+	SignTBS    [maxSignTBS]uints.U8
+	SignLen    frontend.Variable
+	SignSig    ECDSASignature
+	SignPubOff frontend.Variable // hint: offset of subjectPublicKey in TCB-Signing TBS
+	SignValidityOff frontend.Variable // hint: offset of Validity SEQUENCE in TCB-Signing TBS (H3)
+
+	TcbInfoRaw      [maxTcbInfo]uints.U8
+	TcbInfoRawLen   frontend.Variable
+	TcbInfoSig      ECDSASignature
+	TcbInfoFmspcOff frontend.Variable // hint: offset of "fmspc":" in TCB-Info JSON
+
+	// G2: per-level offset hints into the signed TCB-Info JSON, used to bind the
+	// TCB-verdict comparison values (svn components, pcesvn, tcbStatus) to the
+	// Intel-signed bytes. One TcbLevelOff per platform TCB level slot.
+	TcbLvlOff      [MaxTcbLevels]TcbLevelOff
+	TcbLevelsOff   frontend.Variable                   // hint: offset of "tcbLevels":[ (top-level array)
+	TcbLvlStartOff [MaxTcbLevels - 1]frontend.Variable // hint: level starts for slots 1..N-1
+
+	QeIDRaw    [maxQeID]uints.U8
+	QeIDRawLen frontend.Variable
+	QeIDSig    ECDSASignature
+
+	// G2: offset hints into the signed QE-Identity JSON.
+	QeIdOff QeIdOffsets
+
+	// G4 (freshness): validity-window date offsets into the signed JSON. The
+	// Timestamp public input is interpreted as packed YYYYMMDDhhmmss; the circuit
+	// asserts issueDate <= Timestamp <= nextUpdate for both collateral blobs.
+	TcbIssueDateOff  frontend.Variable // "issueDate":" in TCB-Info
+	TcbNextUpdateOff frontend.Variable // "nextUpdate":" in TCB-Info
+	QeIssueDateOff   frontend.Variable // "issueDate":" in QE-Identity
+	QeNextUpdateOff  frontend.Variable // "nextUpdate":" in QE-Identity
+
+	// G4 (revocation): the Intel-signed PCK CRL (signed by the Platform CA) and
+	// Root CA CRL. verifyCrlNonMembership proves each CRL signature and that the
+	// chain serial does not occur in the signed revoked list (substring-absence,
+	// which also forbids supplying an empty list). The PCK CRL covers the leaf
+	// serial; the Root CA CRL covers the intermediate serial.
+	PckCrlTBS           [pckCrlMaxTBS]uints.U8
+	PckCrlTBSLen        frontend.Variable
+	PckCrlSig           ECDSASignature
+	PckCrlThisUpdateOff frontend.Variable // hint: thisUpdate UTCTime offset (G4 C5)
+
+	RootCrlTBS           [rootCrlMaxTBS]uints.U8
+	RootCrlTBSLen        frontend.Variable
+	RootCrlSig           ECDSASignature
+	RootCrlThisUpdateOff frontend.Variable // hint: thisUpdate UTCTime offset (G4 C5)
+
+	// === QE Identity policy fields (from the QE-Identity JSON; residual: see dcap.go) ===
 	QeIdMrSigner   [32]uints.U8
 	QeIdIsvProdId  frontend.Variable // u16
 	QeIdMiscSelect [4]uints.U8
@@ -142,14 +221,12 @@ type DcapCircuit struct {
 	// QE TCB levels (for QE identity step 6/9)
 	QeIdTcbIsvSvn   [MaxQeTcbLevels]frontend.Variable // each level's isvsvn threshold
 	QeIdTcbSeverity [MaxQeTcbLevels]frontend.Variable // each level's severity
-	QeIdTcbCount    frontend.Variable                  // actual number of levels
-	QeTcbMatchIdx   frontend.Variable                  // hint: which level matched
+	QeIdTcbCount    frontend.Variable                 // actual number of levels
+	QeTcbMatchIdx   frontend.Variable                 // hint: which level matched
 
-	// Platform TCB levels (step 8)
-	PlatformFmspc    [6]uints.U8
-	TcbInfoFmspc     [6]uints.U8
-	PlatformCpuSvn   [16]uints.U8
-	PlatformPceSvn   frontend.Variable // u16
+	// === Platform TCB (from the TCB-Info JSON; residual: see dcap.go) ===
+	PlatformCpuSvn    [16]uints.U8
+	PlatformPceSvn    frontend.Variable // u16
 	PlatformTeeTcbSvn [16]uints.U8
 
 	// TCB level data (padded arrays)
@@ -159,4 +236,30 @@ type DcapCircuit struct {
 	TcbSeverity   [MaxTcbLevels]frontend.Variable
 	TcbLevelCount frontend.Variable
 	TcbMatchIdx   frontend.Variable // hint: which platform TCB level matched
+}
+
+// TcbLevelOff carries the host-supplied byte offsets into the signed TCB-Info
+// JSON for one tcbLevels entry (G2 binding). SgxSvnOff/TdxSvnOff hold the
+// offsets of components 1..15 (component 0 is pinned to the array-start anchor).
+type TcbLevelOff struct {
+	// SgxArrOff is NOT a witness field: it is derived in-circuit from the level
+	// start (lvlStart + len(`{"tcb":{`)), so the prover cannot move it.
+	SgxSvnOff [MaxSgxComponents - 1]frontend.Variable // {"svn": of comps 1..15
+	PceSvnOff frontend.Variable                       // "pcesvn":
+	TdxArrOff frontend.Variable                       // "tdxtcbcomponents":[
+	TdxSvnOff [MaxTdxComponents - 1]frontend.Variable // {"svn": of comps 1..15
+	StatusOff frontend.Variable                       // "tcbStatus":"
+}
+
+// QeIdOffsets carries the host-supplied byte offsets into the signed
+// QE-Identity JSON (G2 binding).
+type QeIdOffsets struct {
+	MrSignerOff   frontend.Variable
+	IsvProdIdOff  frontend.Variable
+	MiscSelectOff frontend.Variable
+	MiscMaskOff   frontend.Variable
+	AttrOff       frontend.Variable
+	AttrMaskOff   frontend.Variable
+	QeLvlOff      [MaxQeTcbLevels]frontend.Variable // {"tcb":{"isvsvn": per level
+	QeStatusOff   [MaxQeTcbLevels]frontend.Variable // "tcbStatus":" per level
 }
