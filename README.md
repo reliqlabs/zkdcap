@@ -1,114 +1,111 @@
 # zkDCAP — Zero-Knowledge DCAP Quote Verification
 
-ZK proof system for Intel TDX DCAP attestation quotes. It produces a Groth16 proof
-(gnark, BN254) that a TDX quote is valid, so a recipient can check the attestation
-on-chain without replaying the full DCAP verification cryptography.
+ZK proof system for Intel TDX DCAP attestation. It produces a succinct proof that a
+TDX quote is valid under the full Intel DCAP trust chain, so a recipient can check the
+attestation on-chain (Xion `x/zk`, which charges zero gas for proof verification)
+without replaying the DCAP cryptography. Two interchangeable proving backends are
+provided:
 
-## Architecture
+- **gnark / Groth16** (BN254) — the known-quantity path; per-circuit trusted setup, smallest proof.
+- **Noir / Barretenberg UltraHonk** (BN254) — no per-circuit trusted setup; deployed and on-chain verified on xion-testnet-2.
+
+Both circuits are **self-anchoring**: the Intel SGX Root CA public key is a hardcoded
+constant, and the circuit validates the entire PCK certificate chain, the collateral
+signatures, the TCB status, certificate/CRL revocation, and every freshness window in
+zero knowledge. A forged proof cannot substitute its own trust anchor, key, quote, or
+collateral. The host fetches Intel PCS collateral and builds the witness; it is not
+trusted for any validation (the circuit re-derives everything from the signed bytes).
+
+## What the circuit proves
+
+- **A1 — PCK chain**: leaf ← Platform/Processor CA ← pinned Intel SGX Root CA (constant). Both links SHA-256 + ECDSA P-256 verified; the leaf subject public key binds the PCK key.
+- **A2 — collateral**: TCB-Signing cert ← root; the TCB-Info and QE-Identity JSON are signed by the TCB-Signing key.
+- **Steps 4-10**: QE report signature (by PCK), `report_data` binds the attestation key (G3), QE identity policy (MRSIGNER, ISVPRODID, masked MISCSELECT/ATTRIBUTES), ISV signature (by the attestation key), and the public measurement binding.
+- **TCB status (G2/G5)**: every comparison value is read from the signed JSON (per-level SGX/TDX component SVNs, pcesvn, status→severity; QE isvsvn + status); canonical first-satisfiable level; merged severity asserted ≠ Revoked.
+- **Revocation (G4)**: CRL non-membership for BOTH the PCK CRL and the Root CA CRL — each is a validly-signed CRL (C4 v2 tbsCertList structure anchor + C5 freshness window) and the target serial is absent from the revoked list.
+- **Freshness/validity**: issueDate ≤ Timestamp ≤ nextUpdate on TCB-Info, QE-Identity, and both CRLs; notBefore ≤ Timestamp ≤ notAfter on every chain cert.
+
+Public outputs: `MrTd`, `Rtmr0..3`, `ReportData`, `TcbStatus`, `Timestamp`, `CertSerial`, `Fmspc`. (The Noir circuit packs these into 17 BN254 field elements to fit the Xion `x/zk` public-input cap.)
+
+Both circuits were hardened over repeated adversarial fan-out audits (the gnark circuit converged to zero residuals over five rounds; the Noir circuit's two optimizations were checked sound-equivalent across six independent reviews).
+
+## Layout
 
 ```
 zkdcap/
 ├── core/                  # Shared Rust types (DcapJournal)
-├── host/                  # Host library: Intel PCS collateral fetch + PCK cert-chain
-│                          #   pre-verification, then dispatch to the gnark prover
-├── circuits/dcap-gnark/   # gnark Groth16 circuit for DCAP steps 4-10, witness builder, CLI tools
-├── examples/dstack-prove/ # Example dstack TEE HTTP service that proves its own quote
-└── test/                  # Helper to capture shared fixtures (quote.bin, collateral.json, timestamp.txt)
+├── host/                  # Host: Intel PCS collateral fetch + witness build, dispatch to a prover
+├── circuits/dcap-gnark/   # gnark Groth16 circuit + witness builder + CLI tools
+├── circuits/dcap-noir/    # Noir / Barretenberg UltraHonk circuit (workspace: p256_one, certlink, dcap) + Go witness gen
+├── examples/dstack-prove/ # Example dstack TEE service that proves its own quote
+└── test/                  # Shared fixtures (quote.bin, collateral.json, timestamp.txt)
 ```
 
-DCAP verification is split between an untrusted host and the circuit:
+## gnark circuit (Groth16)
 
-- Steps 1-3 run on the host (`host/`, via `dcap-qvl`): fetch collateral from Intel PCS
-  and validate the PCK certificate chain, producing `PreVerifiedInputs`.
-- Steps 4-10 run in the circuit (`circuits/dcap-gnark/`) and are proven in zero knowledge.
-
-## Proof pipeline
-
-`prove_quote(raw_tdx_quote, ProverBackend::Gnark { socket_path, gpu })` in `host/`:
-
-1. Fetch PCS collateral from Intel (cert chains, TCB info, QE identity).
-2. Validate the cert chain on the host and extract `PreVerifiedInputs` (steps 1-3).
-3. Send the quote, pre-verified inputs, and timestamp over a unix socket to a
-   gnark-prove server, which builds the witness and returns a Groth16 proof of steps 4-10.
-
-The gnark-prove server is a separate long-running process. It loads the constraint
-system (`ccs.bin`) and proving key (`pk.bin`) at boot so it does not recompile the
-circuit on every request.
-
-## Circuit
-
-`circuits/dcap-gnark/circuit` implements DCAP steps 4-10 on BN254:
-
-- Step 4: QE report ECDSA P-256 signature, verified with the PCK public key.
-- Step 5: `SHA-256(attest_key || qe_auth_data)` equals `qe_report.report_data[0:32]`.
-- Step 6: QE identity policy (MRSIGNER, ISVPRODID, masked MISCSELECT, masked ATTRIBUTES).
-- Step 7: ISV report ECDSA P-256 signature, verified with the attestation key.
-- Step 8: platform TCB level match (FMSPC, PCE SVN, SGX and TDX component SVNs).
-- Steps 9-10: merge the QE and platform TCB severities, assert the result is not
-  `Revoked`, and bind the final `TcbStatus`.
-
-### Public inputs
-
-The circuit exposes the attested measurements directly as public inputs, bound from
-the signed quote region (which the step-7 ISV signature authenticates):
-
-`MrTd`, `Rtmr0`, `Rtmr1`, `Rtmr2`, `Rtmr3` (48 bytes each), `ReportData` (64 bytes),
-`TcbStatus`, and `Timestamp`.
-
-## On-chain verification
-
-The verifying key is registered with Xion's ZK module:
+`circuits/dcap-gnark/circuit` implements the full self-anchoring verification on BN254
+(chain.go / collateral.go / crl.go / tcbextract.go / extract.go / derive.go …). Field
+extraction uses a `std/lookup` logderivlookup byte table (each read ~3 constraints).
+It is the slower-per-gate but well-understood path; the CRL non-membership uses a
+direct per-byte substring scan over both CRLs. Negative tests teeth-verify every gap
+class (G1–G5, C1–C5, F1–F3, H1–H3).
 
 ```sh
 cd circuits/dcap-gnark
-go run ./cmd/keygen --ccs ccs.bin --pk pk.bin --vk vk.bin
-xiond tx zk add-vkey --name zkdcap-gnark \
-  --vkey-bytes $(base64 < vk.bin) \
-  --proof-system PROOF_SYSTEM_GROTH16_GNARK
-```
-
-A proof can be checked against `vk.bin` with `cmd/verify-remote`, either from a saved
-proof file or a running prover endpoint:
-
-```sh
-go run ./cmd/verify-remote -proof proof.json -vk vk.bin
-go run ./cmd/verify-remote -url '<prover-endpoint>' -vk vk.bin
-```
-
-## Development
-
-### Circuit (Go)
-
-```sh
-cd circuits/dcap-gnark
-go test ./...          # compile the circuit and run prove/verify against fixtures
-go run ./cmd/keygen    # compile + groth16.Setup -> ccs.bin, pk.bin, vk.bin
-```
-
-`TestCircuitCompile` logs the constraint count. Circuit fixtures live under
-`circuits/dcap-gnark/testdata/fixtures/zkdcap/` (`quote.bin`, `pre_verified.json`,
-`timestamp.txt`). Generate `pre_verified.json` from raw collateral with:
-
-```sh
+go test ./...                       # compile + prove/verify against fixtures (TestCircuitCompile logs the constraint count)
+go run ./cmd/keygen                 # compile + groth16.Setup -> ccs.bin, pk.bin, vk.bin
 go run ./cmd/gen-fixture quote.bin collateral.json pre_verified.json
 ```
 
-### Host (Rust)
+## Noir circuit (UltraHonk) — deployed
+
+`circuits/dcap-noir/crates/dcap` is the Barretenberg UltraHonk circuit. Toolchain:
+nargo 1.0.0-beta.19 + bb 4.0.4 (byte-compatible with Xion's `barretenberg-go` v0.4.0).
+
+- **1,945,749 gates** (under 2²¹); prove ~5.4 s / ~4.4 GB RAM (Apple M5 Max), write_vk ~3.0 s, vk 3680 B, proof 16000 B; no per-circuit trusted setup.
+- Two soundness-preserving optimizations vs the naive form: a rolling-fingerprint **product-accumulator** for CRL non-membership (a 20-byte serial is 160 bits < the BN254 field, so the big-endian window integer is injective; the product is zero iff some window matches), and a **prefix-sum** H1 status pin (one buffer scan replaces a per-level scan). Both audited sound-equivalent; crossing the 2²²→2²¹ dyadic bucket roughly halves prove time.
+- Deployed on **xion-testnet-2** as vkey `dcap-ultrahonk-v1` (id 15) and on-chain verified (`verify-ultrahonk → {"verified":true}`).
+
+```sh
+cd circuits/dcap-noir
+nargo test                          # inline gadget tests
+tools/run_tests.sh                  # honest + negative harness
+nargo execute --package dcap_full   # build witness -> target/dcap_full.gz
+bb write_vk -s ultra_honk -b target/dcap_full.json -o vk
+bb prove    -s ultra_honk -b target/dcap_full.json -w target/dcap_full.gz -k vk/vk -o proof
+bb verify   -s ultra_honk -p proof/proof -k vk/vk -i proof/public_inputs
+```
+
+## On-chain verification (Xion `x/zk`)
+
+Proof verification is a whitelisted query that charges **zero gas**; vkey upload is
+permissionless (any account can `add-vkey`; only the original registrant can
+`update-vkey`/`remove-vkey`).
+
+```sh
+# gnark Groth16
+xiond tx zk add-vkey zkdcap-gnark vk.bin "zkDCAP gnark Groth16" gnark --from <key>
+
+# Noir UltraHonk (as deployed)
+xiond tx zk add-vkey dcap-ultrahonk-v1 circuits/dcap-noir/target/dcap_full.vk \
+  "zkDCAP Noir UltraHonk" ultrahonk --from <key>
+xiond query zk verify-ultrahonk proof/proof \
+  --vkey-name dcap-ultrahonk-v1 --public-inputs-file proof/public_inputs
+```
+
+## Host (Rust)
+
+`prove_quote(raw_tdx_quote, …)` in `host/` fetches PCS collateral from Intel, builds
+the circuit witness, and dispatches to a prover. The gnark backend talks to a
+long-running gnark-prove server over a unix socket (default `/tmp/gnark.sock`) that
+loads `ccs.bin` + `pk.bin` at boot so it does not recompile per request.
 
 ```sh
 cargo build -p zkdcap-host
-
-# refresh the shared quote/collateral fixtures from live Intel PCS + dstack
-cargo test -p zkdcap-test --test save_fixtures --release -- --nocapture
-```
-
-`zkdcap-host` connects to a gnark-prove server over a unix socket (default
-`/tmp/gnark.sock`); start that server with the `pk.bin` and `ccs.bin` produced by
-`cmd/keygen`. The `zkdcap-host` binary fetches a quote from a dstack attestation URL
-and writes a proof:
-
-```sh
 cargo run -p zkdcap-host -- \
   --dstack-url '<attestation-url>' --backend gnark --gnark-socket /tmp/gnark.sock \
   --output proof.json
 ```
+
+> The Rust workspace expects the `dcap-qvl` crate as a sibling checkout
+> (`../dcap-qvl`) for host-side collateral parsing.
