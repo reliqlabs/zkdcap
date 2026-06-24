@@ -37,6 +37,7 @@ echo "== honest =="
 run "honest"          ok   ""
 echo "== negatives =="
 run "G1 fmspc-off"    fail g1-fmspc-off
+run "G1 eval-off"     fail g1-eval-off
 run "C1 tcb-idx"      fail c1-tcb-idx
 run "C1 qe-idx"       fail c1-qe-idx
 run "G2 forged-sgx"   fail g2-forged-sgx
@@ -52,7 +53,7 @@ run "G3 attest-key"   fail g3-attest-key
 run "H3 expired-cert" fail expired-cert
 
 echo "== public-input size (Xion x/zk cap = 10240 B / 320 fields) =="
-# honest witness -> bb prove -> public_inputs must be <= 10240 B (17 packed fields = 544 B).
+# honest witness -> bb prove -> public_inputs must be <= 10240 B (20 packed fields = 640 B).
 "$GEN" -quote "$QUOTE" -collateral "$COLL" > "$DCAP/Prover.toml" 2>/dev/null
 ( cd "$DCAP" && nargo execute >/dev/null 2>&1 )
 PKDIR="$(mktemp -d)"; mkdir -p "$PKDIR/vk" "$PKDIR/proof"

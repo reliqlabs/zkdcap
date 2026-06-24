@@ -77,7 +77,8 @@ func (c *DcapCircuit) Define(api frontend.API) error {
 	// collateral / ISV-signed quote, so steps 8-10 compare signed data, not
 	// free witness.
 	// ----------------------------------------------------------------
-	if err := c.stepBindTcbData(api); err != nil {
+	evalNum, freshLo, freshHi, err := c.stepBindTcbData(api)
+	if err != nil {
 		return err
 	}
 
@@ -97,9 +98,11 @@ func (c *DcapCircuit) Define(api frontend.API) error {
 
 	// ----------------------------------------------------------------
 	// G4 (revocation): the PCK leaf serial is not in the Platform-CA-signed PCK
-	// CRL, and the intermediate serial is not in the Root-CA-signed Root CRL.
+	// CRL, and the intermediate serial is not in the Root-CA-signed Root CRL. This
+	// step also folds the CRL windows into the validity intersection and binds the
+	// #2/#3 public outputs.
 	// ----------------------------------------------------------------
-	return c.stepVerifyRevocation(api)
+	return c.stepVerifyRevocation(api, evalNum, freshLo, freshHi)
 }
 
 // stepVerifyRevocation discharges the revocation half of G4. It re-extracts the
@@ -107,7 +110,7 @@ func (c *DcapCircuit) Define(api frontend.API) error {
 // the PCK CRL, uses the pinned Intel root for the Root CA CRL, and proves that
 // neither the leaf serial (in the PCK CRL) nor the intermediate serial (in the
 // Root CRL) is revoked.
-func (c *DcapCircuit) stepVerifyRevocation(api frontend.API) error {
+func (c *DcapCircuit) stepVerifyRevocation(api frontend.API, evalNum, freshLo, freshHi frontend.Variable) error {
 	// Platform CA subject key (the PCK CRL issuer) from the intermediate TBS.
 	ix, iy, err := extractSubjectPubKey(api, c.IntTBS[:], c.IntPubKeyOff, c.IntTBSLen)
 	if err != nil {
@@ -119,14 +122,33 @@ func (c *DcapCircuit) stepVerifyRevocation(api frontend.API) error {
 	// CRL is structurally anchored (C4) and freshness-checked against Timestamp
 	// (C5) inside verifyCrlNonMembership.
 	leafSerial := extractCertSerial(api, c.LeafTBS[:], c.LeafSerialOff, c.LeafTBSLen)
-	if err := verifyCrlNonMembership(api, c.PckCrlTBS[:], c.PckCrlTBSLen, &platformCA, &c.PckCrlSig, leafSerial, c.PckCrlThisUpdateOff, c.Timestamp); err != nil {
+	pckThis, pckNext, err := verifyCrlNonMembership(api, c.PckCrlTBS[:], c.PckCrlTBSLen, &platformCA, &c.PckCrlSig, leafSerial, c.PckCrlThisUpdateOff, c.Timestamp)
+	if err != nil {
 		return err
 	}
 
 	// Intermediate serial for the Root CA CRL, issued by the pinned root.
 	intSerial := extractCertSerial(api, c.IntTBS[:], c.IntSerialOff, c.IntTBSLen)
 	root := intelRootCAPubKey()
-	return verifyCrlNonMembership(api, c.RootCrlTBS[:], c.RootCrlTBSLen, &root, &c.RootCrlSig, intSerial, c.RootCrlThisUpdateOff, c.Timestamp)
+	rootThis, rootNext, err := verifyCrlNonMembership(api, c.RootCrlTBS[:], c.RootCrlTBSLen, &root, &c.RootCrlSig, intSerial, c.RootCrlThisUpdateOff, c.Timestamp)
+	if err != nil {
+		return err
+	}
+
+	// #3: fold the two CRL windows into the freshness/cert intersection and bind
+	// [ValidFrom, ValidUntil]. Every per-window assert held, so freshLo <=
+	// Timestamp <= freshHi and each CRL window contains Timestamp; the assert below
+	// is a defensive non-empty-intersection guard. The consumer range-checks chain
+	// time against [ValidFrom, ValidUntil] instead of trusting the host Timestamp.
+	validFrom := maxVarWide(api, freshLo, maxVarWide(api, pckThis, rootThis))
+	validUntil := minVarWide(api, freshHi, minVarWide(api, pckNext, rootNext))
+	assertGteWide(api, validUntil, validFrom) // non-empty collateral validity intersection
+	api.AssertIsEqual(validFrom, c.ValidFrom)
+	api.AssertIsEqual(validUntil, c.ValidUntil)
+
+	// #2: bind the min tcbEvaluationDataNumber public output.
+	api.AssertIsEqual(evalNum, c.TcbEvalNum)
+	return nil
 }
 
 // stepBindPublicInputs binds TDReport fields from the private signed quote

@@ -77,6 +77,7 @@ var (
 	jsonQeLvlCtx    = []byte(`{"tcb":{"isvsvn":`)
 	issueDateCtx    = []byte(`"issueDate":"`)
 	nextUpdateCtx   = []byte(`"nextUpdate":"`)
+	evalNumberCtx   = []byte(`"tcbEvaluationDataNumber":`)
 
 	mrSignerCtx   = []byte(`"mrsigner":"`)
 	isvProdIDCtx  = []byte(`"isvprodid":`)
@@ -266,6 +267,16 @@ func build(tw *tomlWriter, quoteBytes []byte, coll map[string]string, ts int64, 
 	tw.num("tcb_next_off", mustIdx(tcbInfoRaw, nextUpdateCtx))
 	tw.num("qe_issue_off", mustIdx(qeIDRaw, issueDateCtx))
 	tw.num("qe_next_off", mustIdx(qeIDRaw, nextUpdateCtx))
+	// tcbEvaluationDataNumber offsets (TCB-recency floor, #2)
+	tcbEvalOff := mustIdx(tcbInfoRaw, evalNumberCtx)
+	if mf.name == "g1-eval-off" {
+		// plant the eval-number offset into the unsigned padding tail (>= tcb_info_len).
+		// extract_field's G1 bound (off + ctx + len <= signed_len) must reject it, so a
+		// forged eval number cannot be read from outside the signed JSON.
+		tcbEvalOff = len(tcbInfoRaw) + 2
+	}
+	tw.num("tcb_eval_off", tcbEvalOff)
+	tw.num("qe_eval_off", mustIdx(qeIDRaw, evalNumberCtx))
 
 	// ---- steps 4-10 ----
 	tw.bytes("qe_report", q.QeReport[:])
@@ -832,6 +843,7 @@ func must(err error) {
 // for the honest run (-mutate ""). The negative-test runner asserts nargo execute
 // FAILS for each. Mutations target a soundness requirement:
 //   g1-fmspc-off     G1: extraction offset planted past signed_len (unsigned tail)
+//   g1-eval-off      G1: tcbEvaluationDataNumber offset planted in the unsigned tail (#2)
 //   c1-tcb-idx       C1: platform TCB match index out of [0,count)
 //   c1-qe-idx        C1: QE match index out of [0,count)
 //   g2-forged-sgx    G2: lower a chosen-level SGX SVN threshold (free witness)

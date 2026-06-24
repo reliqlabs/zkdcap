@@ -73,9 +73,9 @@ func verifyCrlNonMembership(
 	targetSerial []frontend.Variable, // 20 canonical DER bytes (from extractCertSerial)
 	thisUpdateOff frontend.Variable,
 	timestamp frontend.Variable,
-) error {
+) (frontend.Variable, frontend.Variable, error) {
 	if err := verifyCertSig(api, tbs, tbsLen, issuer, sig); err != nil {
-		return err
+		return 0, 0, err
 	}
 	n := len(tbs)
 
@@ -135,7 +135,9 @@ func verifyCrlNonMembership(
 		}
 		api.AssertIsEqual(eq, 0)
 	}
-	return nil
+	// Return the freshness window so the caller can fold it into the intersected
+	// collateral validity window (#3).
+	return thisUpd, nextUpd, nil
 }
 
 // crlSerialCtx anchors a revoked entry's serial inside a CRL TBS. A revoked

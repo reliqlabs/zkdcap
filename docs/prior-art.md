@@ -325,15 +325,22 @@ flag.
    range as an output so a verifier re-checks freshness at consumption rather than trusting
    our single `Timestamp`.
 
-2. **No TCB-recency / `tcbEvaluationDataNumber` output. Confirmed gap.** datachainlab and
+   **Resolved in-circuit (issue #3).** Both circuits now emit `ValidFrom` =
+   `max(notBefore/issueDate/thisUpdate)` and `ValidUntil` = `min(notAfter/nextUpdate)` over
+   every signed window (Noir `main.nr`, gnark `dcap.go`/`tcbextract.go`), with a non-empty
+   intersection asserted. The consumer must range-check chain time against
+   `[ValidFrom, ValidUntil]` (documented in the README); the host-chosen `Timestamp` is now
+   redundant for freshness. The cross-deployment replay binding (risk 3) is still open.
+
+2. **No TCB-recency / `tcbEvaluationDataNumber` output. Resolved in-circuit (issue #2).** datachainlab and
    Automata explicitly defend against a stale-but-validly-signed TCB-Info upgrading status
    by committing `min_tcb_evaluation_data_number` and comparing to an on-chain monotonic
    counter (RISC Zero-based DCAP adds a TCB-R minimum freshness counter checked on-chain).
-   Source check: `tcb.nr` binds SVN levels + severity but does **not** parse or output
-   `tcbEvaluationDataNumber` (no occurrence in the Noir TCB code). So a prover can today
-   use an older-but-still-validly-signed TCB-Info and our timestamp check will not stop it.
-   This is a real, confirmed gap: add a `tcbEvaluationDataNumber` (and/or `qeIdentity`
-   issueDate) output and have the consumer compare against a monotonic on-chain floor.
+   The original gap was real: `tcb.nr` bound SVN levels + severity but never parsed
+   `tcbEvaluationDataNumber`. Both circuits now parse it from the signed TCB-Info **and**
+   QE-Identity JSON and expose `TcbEvalNum = min(tcb, qe)` as a public output (Noir
+   `main.nr` + `g1-eval-off` negative test; gnark `tcbextract.go`). The consumer must reject
+   any `TcbEvalNum` below a monotonic on-chain floor (documented in the README).
 
 3. **Cross-deployment / replay binding.** zk-X509 commits `chainId` + `registryAddress`
    and asserts `registrant == msg.sender`; zkPassport/Self/Reclaim use scoped nullifiers.

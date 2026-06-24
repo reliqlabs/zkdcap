@@ -25,7 +25,9 @@ trusted for any validation (the circuit re-derives everything from the signed by
 - **Revocation (G4)**: CRL non-membership for BOTH the PCK CRL and the Root CA CRL — each is a validly-signed CRL (C4 v2 tbsCertList structure anchor + C5 freshness window) and the target serial is absent from the revoked list.
 - **Freshness/validity**: issueDate ≤ Timestamp ≤ nextUpdate on TCB-Info, QE-Identity, and both CRLs; notBefore ≤ Timestamp ≤ notAfter on every chain cert.
 
-Public outputs: `MrTd`, `Rtmr0..3`, `ReportData`, `TcbStatus`, `Timestamp`, `CertSerial`, `Fmspc`. (The Noir circuit packs these into 17 BN254 field elements to fit the Xion `x/zk` public-input cap.)
+Public outputs: `MrTd`, `Rtmr0..3`, `ReportData`, `TcbStatus`, `Timestamp`, `CertSerial`, `Fmspc`, `TcbEvalNum`, `ValidFrom`, `ValidUntil`. (The Noir circuit packs these into 20 BN254 field elements to fit the Xion `x/zk` public-input cap.)
+
+`TcbEvalNum` is `min(tcbEvaluationDataNumber)` over the signed TCB-Info and QE-Identity, and `[ValidFrom, ValidUntil]` (packed `YYYYMMDDhhmmss`) is the intersection of every signed validity window (cert `notBefore/notAfter`, CRL `thisUpdate/nextUpdate`, collateral `issueDate/nextUpdate`). The proof attests that *some* instant inside that window was valid; the host still picks `Timestamp` inside it. **A consumer MUST therefore (a) range-check chain time against `[ValidFrom, ValidUntil]` rather than trusting the host-chosen `Timestamp`, and (b) reject any `TcbEvalNum` below a monotonic on-chain floor.** Together these close stale-collateral replay and stale-TCB selection (no in-circuit clock or counter exists, so the freshness/recency decision is the consumer's).
 
 Both circuits were hardened over repeated adversarial fan-out audits (the gnark circuit converged to zero residuals over five rounds; the Noir circuit's two optimizations were checked sound-equivalent across six independent reviews).
 
@@ -62,7 +64,7 @@ go run ./cmd/gen-fixture quote.bin collateral.json pre_verified.json
 `circuits/dcap-noir/crates/dcap` is the Barretenberg UltraHonk circuit. Toolchain:
 nargo 1.0.0-beta.19 + bb 4.0.4 (byte-compatible with Xion's `barretenberg-go` v0.4.0).
 
-- **1,945,749 gates** (under 2²¹); prove ~5.4 s / ~4.4 GB RAM (Apple M5 Max), write_vk ~3.0 s, vk 3680 B, proof 16000 B; no per-circuit trusted setup.
+- **1,946,397 gates** (under 2²¹); prove ~5.4 s / ~4.4 GB RAM (Apple M5 Max), write_vk ~3.0 s, vk 3680 B, proof 16000 B; no per-circuit trusted setup.
 - Two soundness-preserving optimizations vs the naive form: a rolling-fingerprint **product-accumulator** for CRL non-membership (a 20-byte serial is 160 bits < the BN254 field, so the big-endian window integer is injective; the product is zero iff some window matches), and a **prefix-sum** H1 status pin (one buffer scan replaces a per-level scan). Both audited sound-equivalent; crossing the 2²²→2²¹ dyadic bucket roughly halves prove time.
 - Deployed on **xion-testnet-2** as vkey `dcap-ultrahonk-v1` (id 15) and on-chain verified (`verify-ultrahonk → {"verified":true}`).
 

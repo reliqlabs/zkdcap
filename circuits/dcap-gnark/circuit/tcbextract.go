@@ -398,7 +398,7 @@ func assertNoLiteralInRange(api frontend.API, buf []uints.U8, lo, hi frontend.Va
 
 // stepBindTcbData discharges G2: it binds the TCB-verdict comparison values to
 // the signature-anchored collateral and quote.
-func (c *DcapCircuit) stepBindTcbData(api frontend.API) error {
+func (c *DcapCircuit) stepBindTcbData(api frontend.API) (frontend.Variable, frontend.Variable, frontend.Variable, error) {
 	// Build ONE logderivlookup table per signed blob; every field read below is a
 	// ~3-constraint lookup instead of an O(buffer) selector (extract.go).
 	tcbTbl := newByteTable(api, c.TcbInfoRaw[:], c.TcbInfoRawLen)
@@ -436,9 +436,10 @@ func (c *DcapCircuit) stepBindTcbData(api frontend.API) error {
 	pceVal := api.Select(is2, api.Add(api.Mul(pce[1], 256), pce[2]), pce[1])
 	api.AssertIsEqual(pceVal, c.PlatformPceSvn)
 
-	// --- G4 freshness: collateral validity window (reuses both blob tables). ---
-	c.stepCheckFreshness(api, tcbTbl, qeTbl)
-	return nil
+	// --- G4 freshness + #2 eval number + #3 freshness/cert validity window
+	// (reuses both blob tables). ---
+	evalNum, validFrom, validUntil := c.stepCheckFreshness(api, tcbTbl, qeTbl)
+	return evalNum, validFrom, validUntil, nil
 }
 
 // stepCheckFreshness discharges the validity-window half of G4: the Timestamp
@@ -447,7 +448,11 @@ func (c *DcapCircuit) stepBindTcbData(api frontend.API) error {
 // the signed JSON (so a prover cannot widen the window), parsed to the same
 // packed integer, and compared. This rejects expired or not-yet-valid
 // collateral (e.g. replaying an old TCB-Info whose nextUpdate has passed).
-func (c *DcapCircuit) stepCheckFreshness(api frontend.API, tcbTbl, qeTbl *byteTable) {
+// Returns (evalNum, validFrom, validUntil): min tcbEvaluationDataNumber across
+// the two blobs (#2), and the freshness+cert half of the intersected validity
+// window (#3, max of lower bounds / min of upper bounds). The caller folds in the
+// two CRL windows.
+func (c *DcapCircuit) stepCheckFreshness(api frontend.API, tcbTbl, qeTbl *byteTable) (frontend.Variable, frontend.Variable, frontend.Variable) {
 	dateCtx := []byte(`"issueDate":"`)
 	nextCtx := []byte(`"nextUpdate":"`)
 	const isoLen = 20 // "YYYY-MM-DDThh:mm:ssZ"
@@ -468,9 +473,22 @@ func (c *DcapCircuit) stepCheckFreshness(api frontend.API, tcbTbl, qeTbl *byteTa
 	// (30 1e 17 0d anchor, 13-char YYMMDDHHMMSSZ values), so the same gadget covers
 	// them. This closes the cert-validity residual: notBefore <= Timestamp <=
 	// notAfter for leaf, Platform CA (intermediate), and TCB-Signing.
-	checkCertValidity(api, c.LeafTBS[:], c.LeafValidityOff, c.LeafTBSLen, c.Timestamp)
-	checkCertValidity(api, c.IntTBS[:], c.IntValidityOff, c.IntTBSLen, c.Timestamp)
-	checkCertValidity(api, c.SignTBS[:], c.SignValidityOff, c.SignLen, c.Timestamp)
+	leafNb, leafNa := checkCertValidity(api, c.LeafTBS[:], c.LeafValidityOff, c.LeafTBSLen, c.Timestamp)
+	intNb, intNa := checkCertValidity(api, c.IntTBS[:], c.IntValidityOff, c.IntTBSLen, c.Timestamp)
+	signNb, signNa := checkCertValidity(api, c.SignTBS[:], c.SignValidityOff, c.SignLen, c.Timestamp)
+
+	// #2: tcbEvaluationDataNumber from BOTH signed blobs; expose the min. A stale
+	// (older eval number) but still-validly-signed blob, replayed inside its open
+	// freshness window, is otherwise indistinguishable in-circuit.
+	evalCtx := []byte(`"tcbEvaluationDataNumber":`)
+	tcbEval := parseDecimal(api, tcbTbl.extractFieldLU(c.TcbEvalOff, evalCtx, u16FieldWidth))
+	qeEval := parseDecimal(api, qeTbl.extractFieldLU(c.QeEvalOff, evalCtx, u16FieldWidth))
+	evalNum := api.Select(gteBool(api, tcbEval, qeEval), qeEval, tcbEval) // min(tcbEval, qeEval)
+
+	// #3: fold the freshness + cert windows into [valid_from, valid_until].
+	validFrom := maxVarWide(api, maxVarWide(api, tcbIssue, qeIssue), maxVarWide(api, leafNb, maxVarWide(api, intNb, signNb)))
+	validUntil := minVarWide(api, minVarWide(api, tcbNext, qeNext), minVarWide(api, leafNa, minVarWide(api, intNa, signNa)))
+	return evalNum, validFrom, validUntil
 }
 
 // checkCertValidity asserts notBefore <= timestamp <= notAfter for an X.509 cert
@@ -478,7 +496,9 @@ func (c *DcapCircuit) stepCheckFreshness(api frontend.API, tcbTbl, qeTbl *byteTa
 // UTCTime). notBefore's 13 UTCTime chars follow the anchor; notAfter is the next
 // UTCTime at +13 value +2 (17 0d) tag/len. timestamp is the packed
 // YYYYMMDDhhmmss verification time.
-func checkCertValidity(api frontend.API, tbs []uints.U8, validityOff, tbsLen, timestamp frontend.Variable) {
+// Returns the (notBefore, notAfter) packed bounds so the caller can fold them
+// into the intersected collateral validity window (#3).
+func checkCertValidity(api frontend.API, tbs []uints.U8, validityOff, tbsLen, timestamp frontend.Variable) (frontend.Variable, frontend.Variable) {
 	nbChars := extractField(api, tbs, validityOff, tbsLen, certValidityCtx, 13)
 	notBefore := parseUtcTime(api, nbChars)
 	naOff := api.Add(validityOff, len(certValidityCtx)+13+2)
@@ -486,6 +506,7 @@ func checkCertValidity(api frontend.API, tbs []uints.U8, validityOff, tbsLen, ti
 	notAfter := parseUtcTime(api, naChars)
 	assertGteWide(api, timestamp, notBefore) // timestamp >= notBefore
 	assertGteWide(api, notAfter, timestamp)  // timestamp <= notAfter
+	return notBefore, notAfter
 }
 
 // deriveAndBindTcbLevels binds every TCB level slot's verdict values and derives

@@ -21,6 +21,8 @@ global CRL_TBS_HEAD_CTX: [u8; 15] =
 // so it is the FIRST UTCTime in the tbsCertList. This bounds that search.
 global CRL_MAX_HEADER_SCAN: u32 = 320;
 
+// Returns the (thisUpdate, nextUpdate) packed bounds so the caller can fold them
+// into the intersected collateral validity window (#3).
 pub fn verify_crl_non_membership<let N: u32>(
     tbs: [u8; N],
     tbs_len: u32,
@@ -30,7 +32,7 @@ pub fn verify_crl_non_membership<let N: u32>(
     target_serial: [u8; 20],
     this_upd_off: u32,
     timestamp: u64,
-) {
+) -> (u64, u64) {
     // 1. signature over the whole TBS.
     cert_link(tbs, tbs_len, issuer_x, issuer_y, sig);
 
@@ -79,6 +81,8 @@ pub fn verify_crl_non_membership<let N: u32>(
     // 4. non-membership: the serial does not occur as a 20-byte window in the signed
     // tbs (see serial_window_product for the exact, non-probabilistic argument).
     assert(serial_window_product(tbs, target_serial) != 0, "serial revoked");
+
+    (this_upd, next_upd)
 }
 
 // Rolling 20-byte fingerprint with a PRODUCT accumulator; returns 0 iff

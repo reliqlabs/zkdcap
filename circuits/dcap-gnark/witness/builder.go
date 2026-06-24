@@ -176,9 +176,28 @@ func BuildWitness(quoteBytes []byte, collateral map[string]string, timestamp uin
 	// === G4 revocation: intermediate serial offset + CRL blobs ===
 	c.IntSerialOff = mustIndex(intTBS, circuit.CertVersionSerialCtx, "intermediate version/serial")
 	c.IntValidityOff = mustIndex(intTBS, circuit.CertValidityCtx, "intermediate validity") // H3
-	if err := fillCrls(c, collateral); err != nil {
+	pckCrl, rootCrl, err := fillCrls(c, collateral)
+	if err != nil {
 		return nil, fmt.Errorf("crls: %w", err)
 	}
+
+	// === #2 tcbEvaluationDataNumber: offsets + min across both signed blobs ===
+	evalCtx := []byte(`"tcbEvaluationDataNumber":`)
+	c.TcbEvalOff = mustIndex(tcbInfoRaw, evalCtx, "tcb eval number")
+	c.QeEvalOff = mustIndex(qeIDRaw, evalCtx, "qe eval number")
+	evalNum := tcbInfo.TcbEvaluationDataNumber
+	if qeJSON.TcbEvaluationDataNumber < evalNum {
+		evalNum = qeJSON.TcbEvaluationDataNumber
+	}
+	c.TcbEvalNum = evalNum
+
+	// === #3 intersected collateral validity window [ValidFrom, ValidUntil] ===
+	validFrom, validUntil, err := collateralValidityWindow(leaf, platformCA, signing, &tcbInfo, &qeJSON, pckCrl, rootCrl)
+	if err != nil {
+		return nil, fmt.Errorf("validity window: %w", err)
+	}
+	c.ValidFrom = validFrom
+	c.ValidUntil = validUntil
 
 	// === QE Identity policy ===
 	copyU8(c.QeIdMrSigner[:], qeParsed.MrSigner[:])
@@ -477,7 +496,13 @@ func fillQeIdOffsets(c *circuit.DcapCircuit, raw []byte, nLevels int) error {
 // packTimestamp converts unix seconds (UTC) to the packed YYYYMMDDhhmmss integer
 // the circuit compares against the collateral validity window.
 func packTimestamp(unix uint64) uint64 {
-	t := time.Unix(int64(unix), 0).UTC()
+	return packTime(time.Unix(int64(unix), 0))
+}
+
+// packTime packs a time.Time (UTC) into the same YYYYMMDDhhmmss integer the
+// circuit derives from UTCTime / ISO-8601 dates (parseUtcTime / parseIso8601).
+func packTime(t time.Time) uint64 {
+	t = t.UTC()
 	return uint64(t.Year())*10000000000 +
 		uint64(t.Month())*100000000 +
 		uint64(t.Day())*1000000 +
@@ -486,22 +511,84 @@ func packTimestamp(unix uint64) uint64 {
 		uint64(t.Second())
 }
 
+// packISODate parses an Intel ISO-8601 collateral date ("YYYY-MM-DDThh:mm:ssZ")
+// and packs it to the same integer space.
+func packISODate(s string) (uint64, error) {
+	t, err := time.Parse("2006-01-02T15:04:05Z", s)
+	if err != nil {
+		return 0, fmt.Errorf("parse date %q: %w", s, err)
+	}
+	return packTime(t), nil
+}
+
+// collateralValidityWindow computes the intersected validity window
+// [ValidFrom, ValidUntil] = [max(lower bounds), min(upper bounds)] across every
+// signed collateral object (#3), packed YYYYMMDDhhmmss. Each bound is exactly the
+// value the circuit derives in-circuit, so the prover-supplied public outputs
+// match the circuit's computed fold.
+func collateralValidityWindow(leaf, platformCA, signing *x509.Certificate, tcbInfo *TcbInfo, qeJSON *QeIdentityJSON, pckCrl, rootCrl *x509.RevocationList) (uint64, uint64, error) {
+	tcbIssue, err := packISODate(tcbInfo.IssueDate)
+	if err != nil {
+		return 0, 0, err
+	}
+	tcbNext, err := packISODate(tcbInfo.NextUpdate)
+	if err != nil {
+		return 0, 0, err
+	}
+	qeIssue, err := packISODate(qeJSON.IssueDate)
+	if err != nil {
+		return 0, 0, err
+	}
+	qeNext, err := packISODate(qeJSON.NextUpdate)
+	if err != nil {
+		return 0, 0, err
+	}
+	lowers := []uint64{
+		packTime(leaf.NotBefore), packTime(platformCA.NotBefore), packTime(signing.NotBefore),
+		tcbIssue, qeIssue,
+		packTime(pckCrl.ThisUpdate), packTime(rootCrl.ThisUpdate),
+	}
+	uppers := []uint64{
+		packTime(leaf.NotAfter), packTime(platformCA.NotAfter), packTime(signing.NotAfter),
+		tcbNext, qeNext,
+		packTime(pckCrl.NextUpdate), packTime(rootCrl.NextUpdate),
+	}
+	validFrom := lowers[0]
+	for _, v := range lowers[1:] {
+		if v > validFrom {
+			validFrom = v
+		}
+	}
+	validUntil := uppers[0]
+	for _, v := range uppers[1:] {
+		if v < validUntil {
+			validUntil = v
+		}
+	}
+	if validFrom > validUntil {
+		return 0, 0, fmt.Errorf("empty collateral validity intersection [%d, %d]", validFrom, validUntil)
+	}
+	return validFrom, validUntil, nil
+}
+
 // fillCrls populates the PCK CRL (Platform-CA-signed) and Root CA CRL
-// (Root-signed) TBS bytes and signatures used by the G4 revocation check.
-func fillCrls(c *circuit.DcapCircuit, coll map[string]string) error {
+// (Root-signed) TBS bytes and signatures used by the G4 revocation check. It
+// returns the parsed CRLs so the caller can fold their validity windows into the
+// intersected collateral window (#3).
+func fillCrls(c *circuit.DcapCircuit, coll map[string]string) (*x509.RevocationList, *x509.RevocationList, error) {
 	pckCrl, err := parseCrlHex(coll["pck_crl"])
 	if err != nil {
-		return fmt.Errorf("pck_crl: %w", err)
+		return nil, nil, fmt.Errorf("pck_crl: %w", err)
 	}
 	rootCrl, err := parseCrlHex(coll["root_ca_crl"])
 	if err != nil {
-		return fmt.Errorf("root_ca_crl: %w", err)
+		return nil, nil, fmt.Errorf("root_ca_crl: %w", err)
 	}
 	if len(pckCrl.RawTBSRevocationList) > len(c.PckCrlTBS) {
-		return fmt.Errorf("pck crl tbs %d exceeds cap %d", len(pckCrl.RawTBSRevocationList), len(c.PckCrlTBS))
+		return nil, nil, fmt.Errorf("pck crl tbs %d exceeds cap %d", len(pckCrl.RawTBSRevocationList), len(c.PckCrlTBS))
 	}
 	if len(rootCrl.RawTBSRevocationList) > len(c.RootCrlTBS) {
-		return fmt.Errorf("root crl tbs %d exceeds cap %d", len(rootCrl.RawTBSRevocationList), len(c.RootCrlTBS))
+		return nil, nil, fmt.Errorf("root crl tbs %d exceeds cap %d", len(rootCrl.RawTBSRevocationList), len(c.RootCrlTBS))
 	}
 	copyU8(c.PckCrlTBS[:], pckCrl.RawTBSRevocationList)
 	c.PckCrlTBSLen = len(pckCrl.RawTBSRevocationList)
@@ -511,7 +598,7 @@ func fillCrls(c *circuit.DcapCircuit, coll map[string]string) error {
 	c.RootCrlTBSLen = len(rootCrl.RawTBSRevocationList)
 	setDERSignature(&c.RootCrlSig, rootCrl.Signature)
 	c.RootCrlThisUpdateOff = firstUtcTimeOffset(rootCrl.RawTBSRevocationList)
-	return nil
+	return pckCrl, rootCrl, nil
 }
 
 // firstUtcTimeOffset returns the offset of the first DER UTCTime (`17 0d`) in a

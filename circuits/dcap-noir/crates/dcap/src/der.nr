@@ -55,7 +55,14 @@ global CERT_VALIDITY_CTX: [u8; 4] = [0x30, 0x1e, 0x17, 0x0d];
 // +4+13, then 13 value chars). The whole TBS is SHA+ECDSA bound, so the dates are
 // signed. This rejects an expired/not-yet-valid cert (e.g. a decommissioned PCK
 // leaf replayed with fresh collateral). timestamp is packed YYYYMMDDhhmmss.
-pub fn check_cert_validity<let N: u32>(tbs: [u8; N], validity_off: u32, signed_len: u32, timestamp: u64) {
+// Returns the (notBefore, notAfter) packed bounds so the caller can fold them
+// into the intersected collateral validity window (#3).
+pub fn check_cert_validity<let N: u32>(
+    tbs: [u8; N],
+    validity_off: u32,
+    signed_len: u32,
+    timestamp: u64,
+) -> (u64, u64) {
     let nb: [u8; 13] = extract_field(tbs, validity_off, signed_len, CERT_VALIDITY_CTX);
     let not_before = crate::parse::parse_utctime(nb);
     // notAfter: its own UTCTime tag/len then 13 value chars.
@@ -64,6 +71,7 @@ pub fn check_cert_validity<let N: u32>(tbs: [u8; N], validity_off: u32, signed_l
     let not_after = crate::parse::parse_utctime(na);
     assert(timestamp >= not_before, "cert not yet valid");
     assert(timestamp <= not_after, "cert expired");
+    (not_before, not_after)
 }
 
 // H3/G-1 gadget tests for check_cert_validity. The real dcap-qvl cert windows
@@ -96,19 +104,21 @@ fn validity_test_buf() -> [u8; 64] {
 #[test]
 fn test_cert_validity_in_window() {
     // 2025-06-01 is inside [2024-01-01, 2026-01-01].
-    check_cert_validity(validity_test_buf(), 0, 64, 20250601000000);
+    let (nb, na) = check_cert_validity(validity_test_buf(), 0, 64, 20250601000000);
+    assert(nb == 20240101000000);
+    assert(na == 20260101000000);
 }
 
 #[test(should_fail_with = "cert expired")]
 fn test_cert_validity_expired() {
     // 2027-06-01 is past notAfter (2026-01-01).
-    check_cert_validity(validity_test_buf(), 0, 64, 20270601000000);
+    let _ = check_cert_validity(validity_test_buf(), 0, 64, 20270601000000);
 }
 
 #[test(should_fail_with = "cert not yet valid")]
 fn test_cert_validity_not_yet_valid() {
     // 2023-06-01 is before notBefore (2024-01-01).
-    check_cert_validity(validity_test_buf(), 0, 64, 20230601000000);
+    let _ = check_cert_validity(validity_test_buf(), 0, 64, 20230601000000);
 }
 
 // Like extract_field but only the anchor (+ one value byte) must be inside the

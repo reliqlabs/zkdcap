@@ -247,7 +247,8 @@ type crlNonMemberCircuit struct {
 }
 
 func (c *crlNonMemberCircuit) Define(api frontend.API) error {
-	return verifyCrlNonMembership(api, c.TBS[:], c.TBSLen, &c.Issuer, &c.Sig, c.TargetSerial[:], c.ThisUpdateOff, c.Timestamp)
+	_, _, err := verifyCrlNonMembership(api, c.TBS[:], c.TBSLen, &c.Issuer, &c.Sig, c.TargetSerial[:], c.ThisUpdateOff, c.Timestamp)
+	return err
 }
 
 func canonicalSerial20(raw []byte) [crlSerialLen]frontend.Variable {

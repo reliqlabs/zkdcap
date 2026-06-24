@@ -498,6 +498,9 @@ pub fn merge_status(platform_sev: u32, qe_sev: u32) -> u32 {
 }
 
 // G4 freshness: issueDate <= Timestamp <= nextUpdate for both collateral blobs.
+// Returns the intersected (lo, hi) packed bounds across the two blobs (lo =
+// max issueDate, hi = min nextUpdate) so the caller can fold them into the global
+// collateral validity window (#3).
 pub fn check_freshness<let TN: u32, let QN: u32>(
     tcb_info: [u8; TN],
     tcb_info_len: u32,
@@ -508,7 +511,7 @@ pub fn check_freshness<let TN: u32, let QN: u32>(
     qe_issue_off: u32,
     qe_next_off: u32,
     timestamp: u64,
-) {
+) -> (u64, u64) {
     let issue_ctx = "\"issueDate\":\"".as_bytes();
     let next_ctx = "\"nextUpdate\":\"".as_bytes();
     let tcb_issue = parse_iso8601(extract_field(tcb_info, tcb_issue_off, tcb_info_len, issue_ctx));
@@ -519,4 +522,7 @@ pub fn check_freshness<let TN: u32, let QN: u32>(
     let qe_next = parse_iso8601(extract_field(qe_id, qe_next_off, qe_id_len, next_ctx));
     assert(timestamp >= qe_issue, "qe_identity not yet valid");
     assert(timestamp <= qe_next, "qe_identity expired");
+    (
+        crate::parse::max_u64(tcb_issue, qe_issue), crate::parse::min_u64(tcb_next, qe_next),
+    )
 }

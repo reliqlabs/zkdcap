@@ -116,6 +116,18 @@ type DcapCircuit struct {
 	// serial and the platform FMSPC, both extracted from signature-bound bytes.
 	CertSerial [certSerialLen]uints.U8 `gnark:",public"`
 	Fmspc      [fmspcLen]uints.U8      `gnark:",public"`
+	// #2 TcbEvalNum = min(tcbEvaluationDataNumber) across the signed TCB-Info and
+	// QE-Identity. The host is untrusted, so a stale-but-validly-signed collateral
+	// (older eval number) could otherwise be replayed inside its still-open
+	// freshness window to pick a more favorable status; the on-chain consumer
+	// compares this against a monotonic floor.
+	TcbEvalNum frontend.Variable `gnark:",public"`
+	// #3 intersected collateral validity window [ValidFrom, ValidUntil], packed
+	// YYYYMMDDhhmmss: max of all window lower bounds / min of all upper bounds. The
+	// consumer range-checks chain time against this instead of trusting the
+	// host-chosen Timestamp, closing the stale-collateral replay gap.
+	ValidFrom  frontend.Variable `gnark:",public"`
+	ValidUntil frontend.Variable `gnark:",public"`
 
 	// === Quote (steps 4-10) ===
 
@@ -194,6 +206,10 @@ type DcapCircuit struct {
 	TcbNextUpdateOff frontend.Variable // "nextUpdate":" in TCB-Info
 	QeIssueDateOff   frontend.Variable // "issueDate":" in QE-Identity
 	QeNextUpdateOff  frontend.Variable // "nextUpdate":" in QE-Identity
+
+	// #2 tcbEvaluationDataNumber offsets in the signed TCB-Info / QE-Identity JSON.
+	TcbEvalOff frontend.Variable // "tcbEvaluationDataNumber":" in TCB-Info
+	QeEvalOff  frontend.Variable // "tcbEvaluationDataNumber":" in QE-Identity
 
 	// G4 (revocation): the Intel-signed PCK CRL (signed by the Platform CA) and
 	// Root CA CRL. verifyCrlNonMembership proves each CRL signature and that the

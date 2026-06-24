@@ -92,6 +92,27 @@ pub fn u16_le(lo: u8, hi: u8) -> u32 {
     lo as u32 + (hi as u32) * 256
 }
 
+// Bound folds for the collateral validity intersection (#3). All window bounds
+// (cert notBefore/notAfter, CRL thisUpdate/nextUpdate, collateral issueDate/
+// nextUpdate) parse to the same packed YYYYMMDDhhmmss u64, so a max of the lower
+// bounds and a min of the upper bounds give the intersected validity window
+// [valid_from, valid_until] in that same comparable space.
+pub fn max_u64(a: u64, b: u64) -> u64 {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+pub fn min_u64(a: u64, b: u64) -> u64 {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
 // Pack K bytes (big-endian) into one BN254 field element: value = sum b[i] *
 // 256^(K-1-i). K must be <= 31 (248 bits < the 254-bit field) so the integer is
 // injective and never wraps. Used to shrink the public-input encoding (each byte

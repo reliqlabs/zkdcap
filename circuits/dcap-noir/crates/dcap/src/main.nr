@@ -14,7 +14,8 @@
 //   G4  revocation (CRL non-membership, C4 structure anchor + C5 freshness) and
 //        collateral freshness windows
 //
-// Public I/O: MrTd, Rtmr0..3, ReportData, TcbStatus, Timestamp, CertSerial, Fmspc.
+// Public I/O: MrTd, Rtmr0..3, ReportData, TcbStatus, Timestamp, CertSerial,
+// Fmspc, TcbEvalNum (#2), ValidFrom, ValidUntil (#3).
 mod der;
 mod parse;
 mod chain;
@@ -97,6 +98,10 @@ fn main(
     tcb_next_off: u32,
     qe_issue_off: u32,
     qe_next_off: u32,
+    // tcbEvaluationDataNumber offsets in the signed TCB-Info / QE-Identity JSON
+    // (TCB-recency floor, #2).
+    tcb_eval_off: u32,
+    qe_eval_off: u32,
     // --- steps 4-10 ---
     qe_report: [u8; 384],
     qe_report_sig: [u8; 64],
@@ -124,7 +129,7 @@ fn main(
     rtmr3: [u8; 48],
     report_data: [u8; 64],
     timestamp: u64,
-) -> pub [Field; 17] {
+) -> pub [Field; 20] {
     // Pin the witness root to the hard-coded Intel SGX Root CA constant.
     let (rx, ry) = crate::chain::pin_root(root_x, root_y);
 
@@ -143,9 +148,12 @@ fn main(
     // every chain-anchored cert. Each TBS is SHA+ECDSA bound, so its dates are
     // signed; this rejects an expired/decommissioned cert replayed with fresh
     // collateral. ----
-    crate::der::check_cert_validity(leaf_tbs, leaf_validity_off, leaf_len, timestamp);
-    crate::der::check_cert_validity(int_tbs, int_validity_off, int_len, timestamp);
-    crate::der::check_cert_validity(sign_tbs, sign_validity_off, sign_len, timestamp);
+    let (leaf_nb, leaf_na) =
+        crate::der::check_cert_validity(leaf_tbs, leaf_validity_off, leaf_len, timestamp);
+    let (int_nb, int_na) =
+        crate::der::check_cert_validity(int_tbs, int_validity_off, int_len, timestamp);
+    let (sign_nb, sign_na) =
+        crate::der::check_cert_validity(sign_tbs, sign_validity_off, sign_len, timestamp);
 
     // ---- identity outputs: FMSPC (leaf == TCB-Info JSON) + PCK serial ----
     let leaf_fmspc: [u8; 6] = extract_field(leaf_tbs, leaf_fmspc_off, leaf_len, FMSPC_CTX);
@@ -185,28 +193,56 @@ fn main(
     let tcb_status = merge_status(platform_sev, qe_sev);
 
     // ---- G4 freshness windows: issueDate <= Timestamp <= nextUpdate ----
-    crate::tcb::check_freshness(
+    let (fresh_lo, fresh_hi) = crate::tcb::check_freshness(
         tcb_info, tcb_info_len, tcb_issue_off, tcb_next_off, qe_id, qe_id_len, qe_issue_off,
         qe_next_off, timestamp,
     );
 
+    // ---- #2 TCB-recency floor: bind tcbEvaluationDataNumber from BOTH signed
+    // blobs and expose min(tcb, qe). The host is untrusted, so a stale-but-validly
+    // -signed TCB-Info/QE-Identity (older eval number) could otherwise be replayed
+    // inside its still-open freshness window to pick a more favorable status. The
+    // on-chain consumer compares this against a monotonic floor. ----
+    let eval_ctx = "\"tcbEvaluationDataNumber\":".as_bytes();
+    let tcb_eval_chars: [u8; 6] = extract_field(tcb_info, tcb_eval_off, tcb_info_len, eval_ctx);
+    let tcb_eval = crate::parse::parse_decimal(tcb_eval_chars);
+    let qe_eval_chars: [u8; 6] = extract_field(qe_id, qe_eval_off, qe_id_len, eval_ctx);
+    let qe_eval = crate::parse::parse_decimal(qe_eval_chars);
+    let eval_num = if tcb_eval < qe_eval { tcb_eval } else { qe_eval };
+
     // ---- G4 revocation: leaf serial not in PCK CRL; int serial not in Root CRL ----
     let (pca_x, pca_y) = crate::chain::extract_subject_pubkey(int_tbs, int_pk_off, int_len);
-    verify_crl_non_membership(
+    let (pck_this, pck_next) = verify_crl_non_membership(
         pck_crl_tbs, pck_crl_len, pca_x, pca_y, pck_crl_sig, serial, pck_crl_thisupd_off, timestamp,
     );
     let int_serial = extract_cert_serial(int_tbs, int_serial_off, int_len);
-    verify_crl_non_membership(
+    let (root_this, root_next) = verify_crl_non_membership(
         root_crl_tbs, root_crl_len, rx, ry, root_crl_sig, int_serial, root_crl_thisupd_off,
         timestamp,
     );
 
-    // ---- pack the public outputs into 17 BN254 field elements (Xion x/zk caps
-    // UltraHonk public inputs at 320 fields; one-byte-per-field would be 332).
+    // ---- #3 intersected collateral validity window. Every check above asserted
+    // its window contains `timestamp`; fold the per-window bounds into
+    // [valid_from, valid_until] = [max(lower bounds), min(upper bounds)] and expose
+    // them. Because every assert held, valid_from <= timestamp <= valid_until, so
+    // the window is non-empty. The on-chain consumer range-checks chain time
+    // against [valid_from, valid_until] instead of trusting the host-chosen
+    // `timestamp`, which closes the stale-collateral replay gap. ----
+    let mut valid_from = crate::parse::max_u64(leaf_nb, crate::parse::max_u64(int_nb, sign_nb));
+    valid_from = crate::parse::max_u64(valid_from, fresh_lo);
+    valid_from = crate::parse::max_u64(valid_from, crate::parse::max_u64(pck_this, root_this));
+    let mut valid_until = crate::parse::min_u64(leaf_na, crate::parse::min_u64(int_na, sign_na));
+    valid_until = crate::parse::min_u64(valid_until, fresh_hi);
+    valid_until = crate::parse::min_u64(valid_until, crate::parse::min_u64(pck_next, root_next));
+    assert(valid_from <= valid_until, "empty collateral validity intersection");
+
+    // ---- pack the public outputs into 20 BN254 field elements (Xion x/zk caps
+    // UltraHonk public inputs at 320 fields; one-byte-per-field would be far more).
     // Every byte below is already bound to the signed quote / leaf / collateral,
     // so the packed values are non-forgeable; this only changes the encoding.
     // Layout (must match the on-chain unpacker): mr_td, rtmr0..3 (2 limbs each),
-    // report_data (3 limbs), tcb_status, timestamp, cert_serial, fmspc. ----
+    // report_data (3 limbs), tcb_status, timestamp, cert_serial, fmspc,
+    // tcb_eval_num, valid_from, valid_until. ----
     let (mr0, mr1) = crate::parse::pack_48(mr_td);
     let (r00, r01) = crate::parse::pack_48(rtmr0);
     let (r10, r11) = crate::parse::pack_48(rtmr1);
@@ -224,5 +260,8 @@ fn main(
         timestamp as Field, // 15    timestamp
         crate::parse::pack_be(serial), // 16    cert_serial[20]
         crate::parse::pack_be(leaf_fmspc), // 17    fmspc[6]
+        eval_num as Field, // 18    tcb_eval_num = min(tcbEvaluationDataNumber)
+        valid_from as Field, // 19    valid_from  = max(window lower bounds)
+        valid_until as Field, // 20    valid_until = min(window upper bounds)
     ]
 }

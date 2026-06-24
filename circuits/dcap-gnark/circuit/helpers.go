@@ -136,6 +136,26 @@ func maxVar(api frontend.API, a, b frontend.Variable) frontend.Variable {
 	return api.Select(isGte, a, b)
 }
 
+// gteBoolWide returns 1 iff a >= b for packed YYYYMMDDhhmmss timestamps (< 2^52),
+// WITHOUT asserting. Same offset trick as gteBool / assertGteWide but at the
+// wider bit width the packed dates need. Used to fold the collateral validity
+// windows into [valid_from, valid_until] (#3).
+func gteBoolWide(api frontend.API, a, b frontend.Variable) frontend.Variable {
+	const n = 52
+	shifted := api.Add(api.Sub(a, b), 1<<n) // in [1, 2^(n+1)) when |a-b| < 2^n
+	bits := api.ToBinary(shifted, n+1)
+	return bits[n] // 1 iff a >= b
+}
+
+// maxVarWide / minVarWide select max/min of two packed timestamps (< 2^52).
+func maxVarWide(api frontend.API, a, b frontend.Variable) frontend.Variable {
+	return api.Select(gteBoolWide(api, a, b), a, b)
+}
+
+func minVarWide(api frontend.API, a, b frontend.Variable) frontend.Variable {
+	return api.Select(gteBoolWide(api, a, b), b, a)
+}
+
 // u16FromLEBytes converts 2 little-endian uints.U8 to a frontend.Variable.
 func u16FromLEBytes(api frontend.API, lo, hi uints.U8) frontend.Variable {
 	return api.Add(lo.Val, api.Mul(hi.Val, 256))
