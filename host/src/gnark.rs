@@ -65,8 +65,6 @@ pub async fn generate_proof(
     Ok(ProofOutput {
         proof: proof_value,
         public_inputs: Vec::new(),
-        journal: String::new(),
-        zkvm: "gnark".to_string(),
     })
 }
 

@@ -3,7 +3,7 @@ use clap::Parser;
 use serde::Deserialize;
 use std::path::PathBuf;
 
-use zkdcap_host::{prove_quote, ProverBackend};
+use zkdcap_host::prove_quote;
 
 #[derive(Parser)]
 #[command(name = "zkdcap-host", about = "Generate zkDCAP attestation proofs")]
@@ -16,8 +16,8 @@ struct Args {
     #[arg(long, default_value = "proof.json")]
     output: PathBuf,
 
-    /// Prover backend: sp1 or gnark
-    #[arg(long, default_value = "sp1")]
+    /// Prover backend: gnark (CPU) or gnark-gpu
+    #[arg(long, default_value = "gnark")]
     backend: String,
 
     /// Path to gnark-prove unix socket (only for gnark backend)
@@ -35,16 +35,10 @@ struct AttestationResponse {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let backend = match args.backend.as_str() {
-        "gnark" | "gnark-cpu" => ProverBackend::Gnark {
-            socket_path: args.gnark_socket,
-            gpu: false,
-        },
-        "gnark-gpu" => ProverBackend::Gnark {
-            socket_path: args.gnark_socket,
-            gpu: true,
-        },
-        _ => ProverBackend::Sp1,
+    let (socket_path, gpu) = match args.backend.as_str() {
+        "gnark" | "gnark-cpu" => (args.gnark_socket, false),
+        "gnark-gpu" => (args.gnark_socket, true),
+        other => anyhow::bail!("unknown backend '{other}' (use gnark or gnark-gpu)"),
     };
 
     // 1. Fetch quote from dstack
@@ -64,7 +58,7 @@ async fn main() -> Result<()> {
 
     // 2. Generate proof (fetches collateral + proves)
     println!("Generating proof...");
-    let output = prove_quote(&quote, &backend).await?;
+    let output = prove_quote(&quote, &socket_path, gpu).await?;
 
     // 3. Write output
     let json = serde_json::to_string_pretty(&output)?;

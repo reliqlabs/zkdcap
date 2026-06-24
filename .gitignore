@@ -33,3 +33,7 @@ circuits/dcap-gnark/testdata/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local agent tooling (colosseum adversarial framework + opencode config)
+.colosseum/
+.opencode/

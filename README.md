@@ -1,120 +1,114 @@
 # zkDCAP — Zero-Knowledge DCAP Quote Verification
 
-ZK proof system for Intel TDX DCAP attestation quotes. Generates a Groth16 proof that a TDX quote is valid, verifiable on-chain without replaying the full verification logic.
+ZK proof system for Intel TDX DCAP attestation quotes. It produces a Groth16 proof
+(gnark, BN254) that a TDX quote is valid, so a recipient can check the attestation
+on-chain without replaying the full DCAP verification cryptography.
 
 ## Architecture
 
 ```
-contracts/zkdcap/
-├── core/              # Shared types (DcapJournal, etc.)
-├── elf/               # Pre-built SP1 guest ELF binary (~742KB)
-├── host/              # Host-side library: collateral fetch + proof generation
-├── sp1-guest/         # SP1 lite guest (steps 4-10, uses PreVerifiedInputs)
-├── sp1-guest-full/    # SP1 full guest (steps 1-10, uses PreparedCollateral)
-├── test/              # Test fixtures (quote.bin, collateral.json, timestamp.txt)
-├── verifier/          # On-chain Groth16 verifier contract
-└── vkey-converter/    # SP1 verification key format converter
+zkdcap/
+├── core/                  # Shared Rust types (DcapJournal)
+├── host/                  # Host library: Intel PCS collateral fetch + PCK cert-chain
+│                          #   pre-verification, then dispatch to the gnark prover
+├── circuits/dcap-gnark/   # gnark Groth16 circuit for DCAP steps 4-10, witness builder, CLI tools
+├── examples/dstack-prove/ # Example dstack TEE HTTP service that proves its own quote
+└── test/                  # Helper to capture shared fixtures (quote.bin, collateral.json, timestamp.txt)
 ```
 
-### Proof Pipeline
+DCAP verification is split between an untrusted host and the circuit:
 
-`prove_quote(raw_tdx_quote)` runs the full pipeline:
+- Steps 1-3 run on the host (`host/`, via `dcap-qvl`): fetch collateral from Intel PCS
+  and validate the PCK certificate chain, producing `PreVerifiedInputs`.
+- Steps 4-10 run in the circuit (`circuits/dcap-gnark/`) and are proven in zero knowledge.
 
-1. Fetch PCS collateral from Intel (cert chains, TCB info, QE identity)
-2. Host-side cert chain validation → `PreVerifiedInputs` (steps 1-3)
-3. SP1 Groth16 proof of steps 4-10 inside the zkVM (lite guest)
+## Proof pipeline
 
-Output is a SnarkJS-compatible Groth16 proof (BN254) with SP1 v6 Keccak commitment fields.
+`prove_quote(raw_tdx_quote, ProverBackend::Gnark { socket_path, gpu })` in `host/`:
 
-### Proof Output Format
+1. Fetch PCS collateral from Intel (cert chains, TCB info, QE identity).
+2. Validate the cert chain on the host and extract `PreVerifiedInputs` (steps 1-3).
+3. Send the quote, pre-verified inputs, and timestamp over a unix socket to a
+   gnark-prove server, which builds the witness and returns a Groth16 proof of steps 4-10.
 
-```json
-{
-  "pi_a": ["<x>", "<y>", "1"],
-  "pi_b": [["<x_real>", "<x_imag>"], ["<y_real>", "<y_imag>"], ["1", "0"]],
-  "pi_c": ["<x>", "<y>", "1"],
-  "commitment": ["<x>", "<y>"],
-  "commitment_pok": "<scalar>",
-  "protocol": "groth16",
-  "curve": "bn128",
-  "public_inputs": ["..."],
-  "journal": "<hex-encoded DcapJournal>",
-  "zkvm": "sp1"
-}
+The gnark-prove server is a separate long-running process. It loads the constraint
+system (`ccs.bin`) and proving key (`pk.bin`) at boot so it does not recompile the
+circuit on every request.
+
+## Circuit
+
+`circuits/dcap-gnark/circuit` implements DCAP steps 4-10 on BN254:
+
+- Step 4: QE report ECDSA P-256 signature, verified with the PCK public key.
+- Step 5: `SHA-256(attest_key || qe_auth_data)` equals `qe_report.report_data[0:32]`.
+- Step 6: QE identity policy (MRSIGNER, ISVPRODID, masked MISCSELECT, masked ATTRIBUTES).
+- Step 7: ISV report ECDSA P-256 signature, verified with the attestation key.
+- Step 8: platform TCB level match (FMSPC, PCE SVN, SGX and TDX component SVNs).
+- Steps 9-10: merge the QE and platform TCB severities, assert the result is not
+  `Revoked`, and bind the final `TcbStatus`.
+
+### Public inputs
+
+The circuit exposes the attested measurements directly as public inputs, bound from
+the signed quote region (which the step-7 ISV signature authenticates):
+
+`MrTd`, `Rtmr0`, `Rtmr1`, `Rtmr2`, `Rtmr3` (48 bytes each), `ReportData` (64 bytes),
+`TcbStatus`, and `Timestamp`.
+
+## On-chain verification
+
+The verifying key is registered with Xion's ZK module:
+
+```sh
+cd circuits/dcap-gnark
+go run ./cmd/keygen --ccs ccs.bin --pk pk.bin --vk vk.bin
+xiond tx zk add-vkey --name zkdcap-gnark \
+  --vkey-bytes $(base64 < vk.bin) \
+  --proof-system PROOF_SYSTEM_GROTH16_GNARK
 ```
 
-SP1 v6 Groth16 proofs are 352 bytes: 256B standard (pi_a + pi_b + pi_c) + 96B Keccak commitment (64B G1 point + 32B scalar proof-of-knowledge).
+A proof can be checked against `vk.bin` with `cmd/verify-remote`, either from a saved
+proof file or a running prover endpoint:
 
-## Current Status
-
-**Working end-to-end.** The async prove queue in oauth3 generates proofs via `?prove=true` on any API endpoint. Proof generation takes ~7 minutes on CPU (24 vCPU Phala CVM).
-
-### Prover Modes
-
-| Mode | Env | Status | Notes |
-|------|-----|--------|-------|
-| CPU | `SP1_PROVER=cpu` | Working | ~7 min on 24 vCPU, ~16 min on macOS arm64 |
-| CUDA GPU | `SP1_PROVER=cuda` | Blocked | See below |
-| Network | `SP1_PROVER=network` | Available | Remote GPU via Succinct prover network |
-| Mock | `SP1_PROVER=mock` | Working | Instant, no real proof (testing only) |
-
-## GPU (CUDA) Blocker
-
-SP1 v6's CUDA prover (`sp1-gpu-server`) cannot run on NVIDIA GPUs in **Confidential Computing (CC) mode**, which is enabled on Phala dstack TEE nodes (H200).
-
-**Root cause:** SP1 v6's GPU backend calls `cudaDeviceGetMemPool()` to use CUDA stream-ordered memory pools. CC-mode disables this API at the driver/firmware level, returning "operation not supported". `sp1-gpu-server` panics on this error.
-
-This is not a configuration issue — it's a fundamental incompatibility between SP1 v6's GPU memory management and NVIDIA's TEE security restrictions. CC-mode disables several CUDA features to prevent GPU memory side-channel attacks.
-
-### Error chain observed
-
+```sh
+go run ./cmd/verify-remote -proof proof.json -vk vk.bin
+go run ./cmd/verify-remote -url '<prover-endpoint>' -vk vk.bin
 ```
-1. sp1-gpu-server starts, initializes CUDA device 0
-2. Calls cudaDeviceGetMemPool() for stream-ordered allocations
-3. CC-mode driver returns: "operation not supported"
-4. sp1-gpu-server panics at task.rs:192 — CudaRustError
-5. oauth3 gets: "Could not connect to sp1-gpu-server socket"
-```
-
-### Options to Resolve
-
-1. **CPU prover (current)** — Works now. ~7 min per proof on 24 vCPU. Acceptable for low-throughput use.
-
-2. **SP1 Network Prover** — Remote GPU proving via Succinct's prover network. No local GPU needed. Requires:
-   - `SP1_PROVER=network`
-   - `NETWORK_PRIVATE_KEY=<secp256k1 hex private key>`
-   - Funded account with `$PROVE` tokens at https://explorer.succinct.xyz
-   - `sp1-sdk` feature `"network"` (already enabled)
-
-3. **Wait for SP1 fix** — SP1 team could add a fallback path that avoids `cudaDeviceGetMemPool()` on CC-mode GPUs. No upstream issue filed yet.
-
-4. **Non-CC GPU node** — If Phala offers GPU nodes without CC-mode, CUDA proving would work immediately. The Nix Docker image already bundles `sp1-gpu-server` and `libcudart.so`.
 
 ## Development
 
-### Build guest ELF
+### Circuit (Go)
 
 ```sh
-cd sp1-guest && cargo prove build
+cd circuits/dcap-gnark
+go test ./...          # compile the circuit and run prove/verify against fixtures
+go run ./cmd/keygen    # compile + groth16.Setup -> ccs.bin, pk.bin, vk.bin
 ```
 
-The pre-built ELF is checked in at `elf/zkdcap-sp1-guest`.
-
-### Run tests
+`TestCircuitCompile` logs the constraint count. Circuit fixtures live under
+`circuits/dcap-gnark/testdata/fixtures/zkdcap/` (`quote.bin`, `pre_verified.json`,
+`timestamp.txt`). Generate `pre_verified.json` from raw collateral with:
 
 ```sh
-# Unit tests (proof format, conversion)
-cargo test -p zkdcap-host
-
-# Full prove + verify (requires SP1 SDK, use --release)
-cargo test --test prove_and_verify --release -- --nocapture
-
-# Refresh test fixtures from live Intel PCS
-cargo test --test save_fixtures --release -- --nocapture
+go run ./cmd/gen-fixture quote.bin collateral.json pre_verified.json
 ```
 
-### Circuit stats
+### Host (Rust)
 
-- ~16M constraints (15,965,950)
-- Groth16 on BN254
-- SP1 v6 (Hypercube) with Keccak commitment scheme
+```sh
+cargo build -p zkdcap-host
+
+# refresh the shared quote/collateral fixtures from live Intel PCS + dstack
+cargo test -p zkdcap-test --test save_fixtures --release -- --nocapture
+```
+
+`zkdcap-host` connects to a gnark-prove server over a unix socket (default
+`/tmp/gnark.sock`); start that server with the `pk.bin` and `ccs.bin` produced by
+`cmd/keygen`. The `zkdcap-host` binary fetches a quote from a dstack attestation URL
+and writes a proof:
+
+```sh
+cargo run -p zkdcap-host -- \
+  --dstack-url '<attestation-url>' --backend gnark --gnark-socket /tmp/gnark.sock \
+  --output proof.json
+```

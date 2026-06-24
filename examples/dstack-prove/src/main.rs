@@ -9,10 +9,10 @@
 //! # Usage
 //!
 //! ```bash
-//! # Run the example (SP1 CPU prover by default)
+//! # Requires a gnark-prove server on the unix socket (default /tmp/gnark.sock)
 //! cargo run --release
 //!
-//! # Or with the gnark backend (requires gnark-prove server running)
+//! # Point at a specific gnark-prove socket
 //! GNARK_SOCKET=/tmp/gnark.sock cargo run --release
 //!
 //! # Test it
@@ -24,8 +24,8 @@
 //!
 //! - `DSTACK_ATTESTATION_URL`: dstack attestation endpoint (default: http://localhost:8090/attestation)
 //! - `PORT`: HTTP listen port (default: 3000)
-//! - `GNARK_SOCKET`: path to gnark-prove unix socket (enables gnark backend)
-//! - `SP1_PROVER`: SP1 prover mode — cpu, cuda, network (default: cpu)
+//! - `GNARK_SOCKET`: path to the gnark-prove unix socket (default: /tmp/gnark.sock)
+//! - `GNARK_GPU`: set to 1/true to request GPU proving
 
 use axum::{extract::Query, response::Json, routing::get, Router};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -90,17 +90,17 @@ async fn info_handler(Query(params): Query<InfoParams>) -> Json<InfoResponse> {
     };
 
     let quote_bytes = B64.decode(&att.quote).unwrap_or_default();
-    let quote_hash = hex::encode(zkdcap_core::DcapJournal::hash_quote(&quote_bytes));
+    let quote_hash = hex::encode(zkdcap_host::hash_quote(&quote_bytes));
 
     // If ?prove=true, generate a ZK proof
     let should_prove = matches!(params.prove.as_deref(), Some("true" | "1"));
 
     if should_prove {
-        let backend = resolve_backend();
-        tracing::info!(?backend, "generating proof...");
+        let (socket_path, gpu) = resolve_backend();
+        tracing::info!(socket_path, gpu, "generating proof...");
 
         let start = Instant::now();
-        match zkdcap_host::prove_quote(&quote_bytes, &backend).await {
+        match zkdcap_host::prove_quote(&quote_bytes, &socket_path, gpu).await {
             Ok(output) => {
                 let elapsed = start.elapsed();
                 tracing::info!(ms = elapsed.as_millis(), "proof generated");
@@ -132,18 +132,13 @@ async fn info_handler(Query(params): Query<InfoParams>) -> Json<InfoResponse> {
     }
 }
 
-fn resolve_backend() -> zkdcap_host::ProverBackend {
-    if let Ok(socket) = std::env::var("GNARK_SOCKET") {
-        let gpu = std::env::var("GNARK_GPU")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false);
-        zkdcap_host::ProverBackend::Gnark {
-            socket_path: socket,
-            gpu,
-        }
-    } else {
-        zkdcap_host::ProverBackend::Sp1
-    }
+fn resolve_backend() -> (String, bool) {
+    let socket_path =
+        std::env::var("GNARK_SOCKET").unwrap_or_else(|_| "/tmp/gnark.sock".to_string());
+    let gpu = std::env::var("GNARK_GPU")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    (socket_path, gpu)
 }
 
 #[tokio::main]
