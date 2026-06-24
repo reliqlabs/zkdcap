@@ -10,8 +10,9 @@
 //!
 //! Per request it runs `genprover -quote -collateral -timestamp > Prover.toml`,
 //! then `nargo execute` (witness), then `bb prove -s ultra_honk`. The proof's
-//! public_inputs ARE the circuit's packed `[Field; 17]` output (mr_td, rtmr0..3,
-//! report_data, tcb_status, timestamp, cert_serial, fmspc); the enclave does not
+//! public_inputs ARE the circuit's packed `[Field; 21]` output (mr_td, rtmr0..3,
+//! report_data, tcb_status, timestamp, cert_serial, fmspc, tcb_eval_num,
+//!   qe_eval_num, valid_from, valid_until); the enclave does not
 //! construct them, only re-checks them. Requests are serialized (the shared
 //! Prover.toml + witness paths); one enclave == one platform, so attestations
 //! are infrequent.
