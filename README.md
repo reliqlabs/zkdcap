@@ -72,10 +72,12 @@ nargo 1.0.0-beta.19 + bb 4.0.4 (byte-compatible with Xion's `barretenberg-go` v0
 cd circuits/dcap-noir
 nargo test                          # inline gadget tests
 tools/run_tests.sh                  # honest + negative harness
-nargo execute --package dcap_full   # build witness -> target/dcap_full.gz
-bb write_vk -s ultra_honk -b target/dcap_full.json -o vk
-bb prove    -s ultra_honk -b target/dcap_full.json -w target/dcap_full.gz -k vk/vk -o proof
-bb verify   -s ultra_honk -p proof/proof -k vk/vk -i proof/public_inputs
+
+# Rebuild the vkey / proof — use the build script (it encodes the bb gotchas):
+tools/build.sh vk                   # compile + vkey  -> target/dcap_full.vk + .vk_hash
+tools/build.sh proof                # witness + vkey + proof + verify (-> target/proof/)
+# NOTE: bb write_vk -o takes a DIRECTORY (writes <dir>/vk); the canonical
+# target/dcap_full.vk is that vk file copied out. build.sh handles this.
 ```
 
 ## On-chain verification (Xion `x/zk`)
