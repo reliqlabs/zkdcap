@@ -1,0 +1,6 @@
+[package]
+name = "dcap_p256_one"
+type = "bin"
+authors = [""]
+
+[dependencies]

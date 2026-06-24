@@ -1,0 +1,2 @@
+[workspace]
+members = ["crates/p256_one", "crates/certlink", "crates/dcap"]
